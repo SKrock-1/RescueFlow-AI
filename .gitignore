@@ -1,0 +1,39 @@
+# Environment and API Secrets
+.env
+.env.local
+*.env
+
+# Python Bytecode and Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Databases & local state
+*.db
+*.db*
+*.sqlite3
+*.db-journal
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Archives and build artifacts
+*.zip
+*.tar.gz
+*.pdf
+scratch/temp*
+
+# System generated logs
+.system_generated/
