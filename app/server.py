@@ -13,6 +13,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from app.agent.agent import AgentRunner
+from app.agent.engines import create_runner
 from app.database.engine import get_db, init_db
 from app.database.models import Incident, Order, ProcessedEvent
 from app.providers.factory import create_provider
@@ -83,7 +84,7 @@ def _run_autonomous_rescue(
         AgentRunner.supersede_open_incidents(local_order_id, keep_incident_id=inc_id)
 
         # Run with resilient fallback provider
-        runner = AgentRunner(provider=create_provider("auto"), max_steps=8)
+        runner = create_runner(provider=create_provider("auto"), max_steps=8)
         result = runner.resolve_incident(inc_id)
 
         # 2-way sync resolution back to Shopify

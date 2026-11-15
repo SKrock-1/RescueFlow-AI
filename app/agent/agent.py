@@ -19,6 +19,7 @@ own claim.
 from __future__ import annotations
 
 from datetime import date as date_cls, datetime, time as time_cls, timezone
+from dataclasses import dataclass, field
 import json
 import logging
 from typing import Any
@@ -48,7 +49,7 @@ from app.domain.lifecycle import (
 from app.agent.observer import AgentObserver
 from app.providers.base import LLMProvider, LLMResponse
 from app.providers.factory import create_provider
-from app.services.policy import PolicyEngine
+from app.services.guardrails import policy_violation
 from app.services.notifications import NotificationDispatcher
 from app.tools.registry import registry
 from app.schemas.models import AgentResult, CandidateAction, ActionType
@@ -97,6 +98,31 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+@dataclass
+class RunContext:
+    """Everything one agent run knows and decides, shared by every engine."""
+
+    incident_id: int
+    order_id: int
+    order_number: str
+    customer_id: int
+    customer_name: str
+    incident_type: str
+    incident_description: str
+    plan_only: bool
+    state: AgentState | None = None
+    trace: AgentTrace | None = None
+    memory_summary: str = ""
+    step_counter: int = 0
+    final_decision_text: str = ""
+    action_executed: bool = False
+    mutation_verified: bool = False
+    provider_failed: bool = False
+    action_name_taken: str | None = None
+    proposed_action: dict[str, Any] | None = None
+    candidate_actions: list[CandidateAction] = field(default_factory=list)
 
 
 class AgentRunner:
@@ -150,24 +176,7 @@ class AgentRunner:
     @staticmethod
     def _policy_violation(tool_name: str, arguments: dict[str, Any], default_order_id: int) -> str | None:
         """Return the guardrail message that blocks this mutation, or None if allowed."""
-        if tool_name == "reschedule_delivery":
-            target_order_id = arguments.get("order_id", default_order_id)
-            with get_db() as db:
-                deliv = db.query(Delivery).filter(Delivery.order_id == target_order_id).first()
-                if deliv:
-                    rule_res = PolicyEngine.rule_repeated_failure_escalation(deliv.attempt_count)
-                    if not rule_res.passed:
-                        return rule_res.message
-        elif tool_name == "reassign_courier":
-            target_courier_id = arguments.get("courier_id")
-            if target_courier_id:
-                with get_db() as db:
-                    cour = db.query(Courier).filter(Courier.id == target_courier_id).first()
-                    if cour:
-                        rule_res = PolicyEngine.rule_courier_active(cour.status)
-                        if not rule_res.passed:
-                            return rule_res.message
-        return None
+        return policy_violation(tool_name, arguments, default_order_id)
 
     @staticmethod
     def _verify_mutation(tool_name: str, arguments: dict[str, Any], default_order_id: int) -> tuple[bool, str]:
@@ -403,10 +412,89 @@ class AgentRunner:
 
         With ``plan_only=True`` the agent investigates but stops at its first
         data-changing action and stores it as a proposal (AWAITING_APPROVAL).
-        """
-        logger.info("Starting resolution for Incident #%d (plan_only=%s)", incident_id, plan_only)
 
-        # 1. Fetch initial incident, order, and customer from DB
+        This is the hand-written Plan-Act-Observe loop. ``app.af.rescue_agent``
+        runs the same run through Microsoft Agent Framework; both share
+        ``_open_run``, ``_before_tool``, ``_after_tool`` and ``_close_run``.
+        """
+        ctx = self._open_run(incident_id, plan_only)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": self._incident_prompt(ctx)},
+        ]
+        tool_schemas = registry.get_openai_tools()
+
+        while ctx.step_counter < self.max_steps and ctx.proposed_action is None:
+            ctx.step_counter += 1
+            ctx.state.current_step = ctx.step_counter
+            logger.info("Agent Step %d / %d (Status: %s)", ctx.step_counter, self.max_steps, ctx.state.status.value)
+
+            try:
+                llm_response: LLMResponse = self.provider.generate(
+                    messages=messages,
+                    tools=tool_schemas,
+                    temperature=0.1,
+                )
+            except Exception as exc:
+                self._provider_failed(ctx, exc)
+                break
+
+            if not llm_response.has_tool_calls:
+                self._record_decision(ctx, llm_response.content or "")
+                break
+
+            messages.append({
+                "role": "assistant",
+                "content": llm_response.content or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": json.dumps(tc["function"]["arguments"]),
+                        },
+                    }
+                    for tc in llm_response.tool_calls
+                ],
+            })
+
+            stop = False
+            for tc in llm_response.tool_calls:
+                tool_name = tc["function"]["name"]
+                arguments = tc["function"]["arguments"]
+                decision, blocked_output = self._before_tool(ctx, tool_name, arguments, llm_response.content)
+                if decision == "propose":
+                    stop = True
+                    break
+                if decision == "block":
+                    tool_output = blocked_output
+                else:
+                    try:
+                        tool_output = registry.execute(tool_name, arguments)
+                    except (ToolNotFoundError, InvalidArgumentsError, ToolExecutionError) as tool_err:
+                        tool_output = {"success": False, "error": str(tool_err)}
+                        ctx.state.errors.append(str(tool_err))
+                stop = self._after_tool(ctx, tool_name, arguments, tool_output, llm_response.content)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": tool_name,
+                    "content": json.dumps(tool_output),
+                })
+                if stop:
+                    break
+            if stop:
+                break
+
+        return self._close_run(ctx)
+
+    # ──────────────────────────────────────────
+    # Run steps shared by every engine
+    # ──────────────────────────────────────────
+    def _open_run(self, incident_id: int, plan_only: bool) -> "RunContext":
+        """Claim an OPEN incident, load its context and memory, start the trace."""
+        logger.info("Starting resolution for Incident #%d (plan_only=%s)", incident_id, plan_only)
         with get_db() as db:
             incident = db.query(Incident).filter(Incident.id == incident_id).first()
             if not incident:
@@ -417,351 +505,300 @@ class AgentRunner:
                     f"Incident {incident_id} is {incident.status}; only OPEN incidents can be run. "
                     f"Create a new incident to try again."
                 )
-
             order = db.query(Order).filter(Order.id == incident.order_id).first()
             if not order:
                 raise ValueError(f"Order {incident.order_id} associated with Incident {incident_id} not found.")
-
             customer = db.query(Customer).filter(Customer.id == order.customer_id).first()
-            customer_name = customer.name if customer else "Unknown Customer"
-            customer_id = customer.id if customer else 0
-            incident_type = incident.incident_type
-            incident_description = incident.description
-            order_number = order.order_number
-            order_id = order.id
+            ctx = RunContext(
+                incident_id=incident_id,
+                order_id=order.id,
+                order_number=order.order_number,
+                customer_id=customer.id if customer else 0,
+                customer_name=customer.name if customer else "Unknown Customer",
+                incident_type=incident.incident_type,
+                incident_description=incident.description,
+                plan_only=plan_only,
+            )
 
-        # 2. Initialize Agent State & Trace
-        state = AgentState(
+        ctx.state = AgentState(
             incident_id=incident_id,
-            order_id=order_id,
-            customer_id=customer_id,
-            goal=f"Resolve incident '{incident_type}' for order {order_number} ({customer_name}).",
+            order_id=ctx.order_id,
+            customer_id=ctx.customer_id,
+            goal=f"Resolve incident '{ctx.incident_type}' for order {ctx.order_number} ({ctx.customer_name}).",
             max_steps=self.max_steps,
             status=AgentStatus.INVESTIGATING,
         )
-        trace = AgentTrace(incident_id=incident_id)
-
+        ctx.trace = AgentTrace(incident_id=incident_id)
         self._record_trace_step(
-            trace=trace,
+            trace=ctx.trace,
             step_number=0,
             event_type="observation",
-            summary=f"Incident opened: '{incident_type}' on order {order_number}.",
-            result={"description": incident_description, "customer": customer_name},
+            summary=f"Incident opened: '{ctx.incident_type}' on order {ctx.order_number}.",
+            result={"description": ctx.incident_description, "customer": ctx.customer_name},
         )
 
-        # 3. Load Persistent Memory
-        memory_summary = summarize_relevant_memory(customer_id, incident_type)
-        customer_memories = load_customer_memory(customer_id)
-        state.memory = customer_memories
-
+        ctx.memory_summary = summarize_relevant_memory(ctx.customer_id, ctx.incident_type)
+        ctx.state.memory = load_customer_memory(ctx.customer_id)
         self._record_trace_step(
-            trace=trace,
+            trace=ctx.trace,
             step_number=0,
             event_type="observation",
             summary="Loaded customer operational memory from database.",
-            result={"entries_count": len(customer_memories)},
+            result={"entries_count": len(ctx.state.memory)},
+        )
+        return ctx
+
+    @staticmethod
+    def _incident_prompt(ctx: "RunContext") -> str:
+        return (
+            f"DELIVERY INCIDENT REPORT:\n"
+            f"- Incident ID: {ctx.incident_id}\n"
+            f"- Order ID: {ctx.order_id} (Order Number: {ctx.order_number})\n"
+            f"- Customer ID: {ctx.customer_id} ({ctx.customer_name})\n"
+            f"- Incident Type: {ctx.incident_type}\n"
+            f"- Description: {ctx.incident_description}\n\n"
+            f"CUSTOMER MEMORY & CONTEXT:\n{ctx.memory_summary}\n\n"
+            f"INSTRUCTIONS:\n"
+            f"Investigate the incident with your tools, evaluate available recovery options, "
+            f"execute the appropriate resolution action, verify the result, and provide your final explanation."
         )
 
-        # 4. Construct initial messages for LLM
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"DELIVERY INCIDENT REPORT:\n"
-                    f"- Incident ID: {incident_id}\n"
-                    f"- Order ID: {order_id} (Order Number: {order_number})\n"
-                    f"- Customer ID: {customer_id} ({customer_name})\n"
-                    f"- Incident Type: {incident_type}\n"
-                    f"- Description: {incident_description}\n\n"
-                    f"CUSTOMER MEMORY & CONTEXT:\n{memory_summary}\n\n"
-                    f"INSTRUCTIONS:\n"
-                    f"Investigate the incident with your tools, evaluate available recovery options, "
-                    f"execute the appropriate resolution action, verify the result, and provide your final explanation."
-                ),
-            },
-        ]
+    def _provider_failed(self, ctx: "RunContext", exc: Exception) -> None:
+        reason = describe_provider_error(exc)
+        logger.error("LLM provider failed: %s", exc)
+        ctx.state.errors.append(f"LLM provider failed: {reason}")
+        self._record_trace_step(
+            trace=ctx.trace,
+            step_number=ctx.step_counter,
+            event_type="error",
+            summary=f"LLM provider failed: {reason}",
+            status="error",
+        )
+        ctx.provider_failed = True
+        ctx.final_decision_text = f"No action was taken. {reason} Retry, or switch to another provider."
 
-        tool_schemas = registry.get_openai_tools()
+    def _record_decision(self, ctx: "RunContext", text: str) -> None:
+        ctx.final_decision_text = (text or "").strip()
+        self._record_trace_step(
+            trace=ctx.trace,
+            step_number=ctx.step_counter,
+            event_type="decision",
+            summary="Final agent decision formulated.",
+            result={"decision": ctx.final_decision_text},
+        )
 
-        step_counter = 0
-        final_decision_text = ""
-        action_executed = False
-        mutation_verified = False
-        provider_failed = False
-        action_name_taken: str | None = None
-        proposed_action: dict[str, Any] | None = None
-        candidate_actions_list: list[CandidateAction] = []
+    def _before_tool(
+        self, ctx: "RunContext", tool_name: str, arguments: dict[str, Any], assistant_text: str | None
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Decide what happens to a tool call before it runs.
 
-        # 5. Iterative Agent Loop (Plan-Act-Observe)
-        while step_counter < self.max_steps and proposed_action is None:
-            step_counter += 1
-            state.current_step = step_counter
+        Returns ("run", None), ("block", tool_output) for a guardrail block,
+        or ("propose", None) when plan-only mode stores it for approval.
+        """
+        state = ctx.state
+        is_mutation = registry.is_mutation(tool_name)
+        if is_mutation:
+            if state.status in {AgentStatus.INVESTIGATING, AgentStatus.EVALUATING}:
+                state.transition_to(AgentStatus.ACTING)
+        elif state.status == AgentStatus.INVESTIGATING and tool_name in {
+            "get_courier_availability", "find_available_delivery_slots"
+        }:
+            state.transition_to(AgentStatus.EVALUATING)
 
-            logger.info("Agent Step %d / %d (Status: %s)", step_counter, self.max_steps, state.status.value)
+        violation = self._policy_violation(tool_name, arguments, ctx.order_id) if is_mutation else None
+        if violation:
+            output = {
+                "success": False,
+                "error": f"Policy Guardrail Blocked: {violation}",
+                "policy_blocked": True,
+            }
+            state.errors.append(output["error"])
+            return "block", output
 
-            try:
-                llm_response: LLMResponse = self.provider.generate(
-                    messages=messages,
-                    tools=tool_schemas,
-                    temperature=0.1,
-                )
-            except Exception as exc:
-                reason = describe_provider_error(exc)
-                logger.error("LLM provider failed: %s", exc)
-                state.errors.append(f"LLM provider failed: {reason}")
-                self._record_trace_step(
-                    trace=trace,
-                    step_number=step_counter,
-                    event_type="error",
-                    summary=f"LLM provider failed: {reason}",
-                    status="error",
-                )
-                provider_failed = True
-                final_decision_text = (
-                    f"No action was taken. {reason} Retry, or switch to another provider."
-                )
-                break
-
-            if llm_response.has_tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "content": llm_response.content or None,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": json.dumps(tc["function"]["arguments"]),
-                            },
-                        }
-                        for tc in llm_response.tool_calls
-                    ],
-                })
-
-                for tc in llm_response.tool_calls:
-                    tool_name = tc["function"]["name"]
-                    arguments = tc["function"]["arguments"]
-                    tool_call_id = tc["id"]
-
-                    # Transition state machine appropriately
-                    if registry.is_mutation(tool_name):
-                        if state.status in {AgentStatus.INVESTIGATING, AgentStatus.EVALUATING}:
-                            state.transition_to(AgentStatus.ACTING)
-                    elif state.status == AgentStatus.INVESTIGATING:
-                        if tool_name in {"get_courier_availability", "find_available_delivery_slots"}:
-                            state.transition_to(AgentStatus.EVALUATING)
-
-                    # ── Deterministic Policy Guardrail Check ──
-                    policy_violation_msg = (
-                        self._policy_violation(tool_name, arguments, order_id)
-                        if registry.is_mutation(tool_name) else None
-                    )
-
-                    # ── Human approval gate: stop before the first allowed mutation ──
-                    if plan_only and registry.is_mutation(tool_name) and not policy_violation_msg:
-                        proposal_args = dict(arguments)
-                        # The agent may only act on the order this incident belongs to.
-                        proposal_args["order_id"] = order_id
-                        proposed_action = {"tool_name": tool_name, "arguments": proposal_args}
-                        state.transition_to(AgentStatus.AWAITING_APPROVAL)
-                        final_decision_text = (llm_response.content or "").strip()
-                        self._record_trace_step(
-                            trace=trace,
-                            step_number=step_counter,
-                            event_type="proposal",
-                            tool_name=tool_name,
-                            summary=f"Proposed {tool_name}; waiting for operator approval.",
-                            arguments=proposal_args,
-                            status="pending",
-                        )
-                        break
-
-                    if policy_violation_msg:
-                        tool_output = {
-                            "success": False,
-                            "error": f"Policy Guardrail Blocked: {policy_violation_msg}",
-                            "policy_blocked": True,
-                        }
-                        tool_status = "error"
-                        state.errors.append(tool_output["error"])
-                    else:
-                        try:
-                            tool_output = registry.execute(tool_name, arguments)
-                            tool_status = "success" if tool_output.get("success", True) else "error"
-                        except (ToolNotFoundError, InvalidArgumentsError, ToolExecutionError) as tool_err:
-                            tool_output = {"success": False, "error": str(tool_err)}
-                            tool_status = "error"
-                            state.errors.append(str(tool_err))
-
-                    # Track candidate actions when slots or escalation are evaluated
-                    if tool_name == "find_available_delivery_slots" and tool_output.get("success"):
-                        for slot_dict in tool_output.get("slots", []):
-                            candidate_actions_list.append(
-                                CandidateAction(
-                                    action=ActionType.RESCHEDULE,
-                                    date=slot_dict.get("date"),
-                                    start_time=slot_dict.get("start_time"),
-                                    end_time=slot_dict.get("end_time"),
-                                    courier_id=slot_dict.get("courier_id"),
-                                    reason=f"Slot with courier {slot_dict.get('courier_name')} ({slot_dict.get('time_block')})",
-                                    score=float(slot_dict.get("score", 0.0)),
-                                    feasible=True,
-                                )
-                            )
-                    elif tool_name == "escalate_incident":
-                        candidate_actions_list.append(
-                            CandidateAction(
-                                action=ActionType.ESCALATE,
-                                reason=arguments.get("reason", "Escalation initiated"),
-                                score=1.0,
-                                feasible=True,
-                            )
-                        )
-
-                    self._record_trace_step(
-                        trace=trace,
-                        step_number=step_counter,
-                        event_type="tool_call",
-                        tool_name=tool_name,
-                        summary=f"Called {tool_name}",
-                        arguments=arguments,
-                        result=tool_output,
-                        status=tool_status,
-                    )
-
-                    # Track mutation execution & verify it against the database
-                    if registry.is_mutation(tool_name) and tool_output.get("success", False):
-                        action_executed = True
-                        action_name_taken = tool_name
-                        if tool_name != "escalate_incident":
-                            state.transition_to(AgentStatus.VERIFYING)
-                        mutation_verified, verify_note = self._verify_mutation(tool_name, arguments, order_id)
-                        self._record_trace_step(
-                            trace=trace,
-                            step_number=step_counter,
-                            event_type="verification",
-                            tool_name=tool_name,
-                            summary=verify_note,
-                            result={"verified": mutation_verified, "detail": verify_note},
-                            status="success" if mutation_verified else "error",
-                        )
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "name": tool_name,
-                        "content": json.dumps(tool_output),
-                    })
-
-                    # Escalation hands the order to a person: no further agent actions.
-                    if tool_name == "escalate_incident" and tool_output.get("success"):
-                        final_decision_text = (llm_response.content or "").strip() or (
-                            f"Escalated to human operations: {arguments.get('reason', '')}".strip()
-                        )
-                        break
-
-                if action_name_taken == "escalate_incident":
-                    break
-                continue
-
-            else:
-                final_decision_text = (llm_response.content or "").strip()
-                self._record_trace_step(
-                    trace=trace,
-                    step_number=step_counter,
-                    event_type="decision",
-                    summary="Final agent decision formulated.",
-                    result={"decision": final_decision_text},
-                )
-                break
-
-        # 6. Post-loop validation and terminal state assignment
-        if proposed_action is not None:
-            state.finish(AgentStatus.AWAITING_APPROVAL)
-            if not final_decision_text:
-                final_decision_text = f"Proposed {proposed_action['tool_name']}; waiting for operator approval."
-        elif provider_failed:
-            state.finish(AgentStatus.FAILED)
-        elif step_counter >= self.max_steps and not final_decision_text:
-            state.finish(AgentStatus.FAILED)
-            final_decision_text = f"Agent stopped: exceeded maximum iteration limit of {self.max_steps} steps without final resolution."
+        if ctx.plan_only and is_mutation:
+            proposal_args = dict(arguments)
+            # The agent may only act on the order this incident belongs to.
+            proposal_args["order_id"] = ctx.order_id
+            ctx.proposed_action = {"tool_name": tool_name, "arguments": proposal_args}
+            state.transition_to(AgentStatus.AWAITING_APPROVAL)
+            ctx.final_decision_text = (assistant_text or "").strip()
             self._record_trace_step(
-                trace=trace,
-                step_number=step_counter,
-                event_type="error",
-                summary="Exceeded max agent steps.",
-                status="error",
+                trace=ctx.trace,
+                step_number=ctx.step_counter,
+                event_type="proposal",
+                tool_name=tool_name,
+                summary=f"Proposed {tool_name}; waiting for operator approval.",
+                arguments=proposal_args,
+                status="pending",
             )
-        elif action_name_taken == "escalate_incident":
-            state.finish(AgentStatus.ESCALATED)
-        elif action_executed and mutation_verified:
-            state.finish(AgentStatus.RESOLVED)
-        elif action_executed:
+            return "propose", None
+        return "run", None
+
+    def _after_tool(
+        self,
+        ctx: "RunContext",
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_output: dict[str, Any],
+        assistant_text: str | None,
+        verify: bool = True,
+    ) -> bool:
+        """Record a finished tool call and verify mutations. Returns True to stop the run.
+
+        ``verify=False`` leaves verification to a separate step (the multi-agent
+        Verifier), which then calls ``_verify_after``.
+        """
+        if tool_name == "find_available_delivery_slots" and tool_output.get("success"):
+            for slot_dict in tool_output.get("slots", []):
+                ctx.candidate_actions.append(
+                    CandidateAction(
+                        action=ActionType.RESCHEDULE,
+                        date=slot_dict.get("date"),
+                        start_time=slot_dict.get("start_time"),
+                        end_time=slot_dict.get("end_time"),
+                        courier_id=slot_dict.get("courier_id"),
+                        reason=f"Slot with courier {slot_dict.get('courier_name')} ({slot_dict.get('time_block')})",
+                        score=float(slot_dict.get("score", 0.0)),
+                        feasible=True,
+                    )
+                )
+        elif tool_name == "escalate_incident":
+            ctx.candidate_actions.append(
+                CandidateAction(
+                    action=ActionType.ESCALATE,
+                    reason=arguments.get("reason", "Escalation initiated"),
+                    score=1.0,
+                    feasible=True,
+                )
+            )
+
+        self._record_trace_step(
+            trace=ctx.trace,
+            step_number=ctx.step_counter,
+            event_type="tool_call",
+            tool_name=tool_name,
+            summary=f"Called {tool_name}",
+            arguments=arguments,
+            result=tool_output,
+            status="success" if tool_output.get("success", True) else "error",
+        )
+
+        if not (registry.is_mutation(tool_name) and tool_output.get("success", False)):
+            return False
+
+        ctx.action_executed = True
+        ctx.action_name_taken = tool_name
+        if tool_name != "escalate_incident":
+            ctx.state.transition_to(AgentStatus.VERIFYING)
+        if verify:
+            self._verify_after(ctx, tool_name, arguments)
+
+        # Escalation hands the order to a person: no further agent actions.
+        if tool_name == "escalate_incident":
+            ctx.final_decision_text = (assistant_text or "").strip() or (
+                f"Escalated to human operations: {arguments.get('reason', '')}".strip()
+            )
+            return True
+        return False
+
+    def _verify_after(self, ctx: "RunContext", tool_name: str, arguments: dict[str, Any]) -> bool:
+        """Re-read the database for an executed change and record the verification step."""
+        ctx.mutation_verified, verify_note = self._verify_mutation(tool_name, arguments, ctx.order_id)
+        self._record_trace_step(
+            trace=ctx.trace,
+            step_number=ctx.step_counter,
+            event_type="verification",
+            tool_name=tool_name,
+            summary=verify_note,
+            result={"verified": ctx.mutation_verified, "detail": verify_note},
+            status="success" if ctx.mutation_verified else "error",
+        )
+        return ctx.mutation_verified
+
+    def _close_run(self, ctx: "RunContext") -> AgentResult:
+        """Pick the outcome, store it on the incident, then remember and notify."""
+        state, trace = ctx.state, ctx.trace
+        if ctx.proposed_action is not None:
+            state.finish(AgentStatus.AWAITING_APPROVAL)
+            if not ctx.final_decision_text:
+                ctx.final_decision_text = f"Proposed {ctx.proposed_action['tool_name']}; waiting for operator approval."
+        elif ctx.provider_failed:
             state.finish(AgentStatus.FAILED)
-            final_decision_text = (
+        elif ctx.step_counter >= self.max_steps and not ctx.final_decision_text and not ctx.action_executed:
+            state.finish(AgentStatus.FAILED)
+            ctx.final_decision_text = (
+                f"Agent stopped: exceeded maximum iteration limit of {self.max_steps} steps without final resolution."
+            )
+            self._record_trace_step(
+                trace=trace, step_number=ctx.step_counter, event_type="error",
+                summary="Exceeded max agent steps.", status="error",
+            )
+        elif ctx.action_name_taken == "escalate_incident":
+            state.finish(AgentStatus.ESCALATED)
+        elif ctx.action_executed and ctx.mutation_verified:
+            state.finish(AgentStatus.RESOLVED)
+        elif ctx.action_executed:
+            state.finish(AgentStatus.FAILED)
+            ctx.final_decision_text = (
                 f"The change could not be verified in the database, so this is not marked as resolved. "
-                f"{final_decision_text}"
+                f"{ctx.final_decision_text}"
             ).strip()
-        elif "escalat" in final_decision_text.lower():
-            if plan_only:
+        elif "escalat" in ctx.final_decision_text.lower():
+            if ctx.plan_only:
                 # Escalating also messages the customer, so it goes through approval too.
-                proposed_action = {
+                ctx.proposed_action = {
                     "tool_name": "escalate_incident",
-                    "arguments": {"order_id": order_id, "reason": final_decision_text[:300]},
+                    "arguments": {"order_id": ctx.order_id, "reason": ctx.final_decision_text[:300]},
                 }
                 state.finish(AgentStatus.AWAITING_APPROVAL)
                 self._record_trace_step(
                     trace=trace,
-                    step_number=step_counter,
+                    step_number=ctx.step_counter,
                     event_type="proposal",
                     tool_name="escalate_incident",
                     summary="Proposed escalate_incident; waiting for operator approval.",
-                    arguments=proposed_action["arguments"],
+                    arguments=ctx.proposed_action["arguments"],
                     status="pending",
                 )
             else:
                 state.finish(AgentStatus.ESCALATED)
         else:
             state.finish(AgentStatus.FAILED)
-            final_decision_text = (
-                f"The agent finished without taking a recovery action. {final_decision_text}"
+            ctx.final_decision_text = (
+                f"The agent finished without taking a recovery action. {ctx.final_decision_text}"
             ).strip()
 
-        # 7. Update Incident record in database
         with get_db() as db:
-            inc = db.query(Incident).filter(Incident.id == incident_id).first()
+            inc = db.query(Incident).filter(Incident.id == ctx.incident_id).first()
             if inc:
                 move_incident(inc, IncidentStatus(state.status.value))
-                inc.agent_decision = final_decision_text
+                inc.agent_decision = ctx.final_decision_text
                 db.flush()
 
         memory_updates: list[str] = []
         notifications_sent: list[dict[str, Any]] = []
         if state.status != AgentStatus.AWAITING_APPROVAL:
             memory_updates, notifications_sent = self._finalize(
-                status=state.status, action_name_taken=action_name_taken, customer_id=customer_id,
-                order_id=order_id, order_number=order_number, incident_type=incident_type,
-                final_decision_text=final_decision_text, trace=trace,
-                step_number=step_counter + 1, errors=state.errors,
+                status=state.status, action_name_taken=ctx.action_name_taken, customer_id=ctx.customer_id,
+                order_id=ctx.order_id, order_number=ctx.order_number, incident_type=ctx.incident_type,
+                final_decision_text=ctx.final_decision_text, trace=trace,
+                step_number=ctx.step_counter + 1, errors=state.errors,
             )
 
         logger.info(
             "Agent finished for Incident #%d. Final Status: %s in %d steps.",
-            incident_id, state.status.value, step_counter
+            ctx.incident_id, state.status.value, ctx.step_counter,
         )
-
         return AgentResult(
-            incident_id=incident_id,
-            order_id=order_id,
-            customer_id=customer_id,
+            incident_id=ctx.incident_id,
+            order_id=ctx.order_id,
+            customer_id=ctx.customer_id,
             status=state.status.value,
-            action_taken=action_name_taken,
-            proposed_action=proposed_action,
-            decision_summary=final_decision_text,
+            action_taken=ctx.action_name_taken,
+            proposed_action=ctx.proposed_action,
+            decision_summary=ctx.final_decision_text,
             trace=trace.events,
-            candidate_actions=candidate_actions_list,
+            candidate_actions=ctx.candidate_actions,
             memory_updates=memory_updates,
             notifications=notifications_sent,
             errors=state.errors,

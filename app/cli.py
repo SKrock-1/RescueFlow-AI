@@ -22,6 +22,7 @@ from app.database.engine import get_db, init_db
 from app.database.models import Incident, Order, Customer, AgentRun
 from app.database.seed import seed_all
 from app.agent.agent import AgentRunner
+from app.agent.engines import ENGINE_LABELS, create_runner
 from app.agent.observer import ConsoleProgressObserver
 from app.providers.factory import create_provider
 
@@ -67,7 +68,7 @@ def cmd_run_incident(args: argparse.Namespace) -> None:
 
     observer = ConsoleProgressObserver()
     provider = create_provider(provider_name=args.provider) if args.provider else None
-    runner = AgentRunner(provider=provider, max_steps=args.steps, observers=[observer])
+    runner = create_runner(engine=getattr(args, "engine", None), provider=provider, max_steps=args.steps, observers=[observer])
 
     try:
         result = runner.resolve_incident(incident_id=incident_id)
@@ -149,6 +150,12 @@ def main() -> None:
         help="Override LLM provider (or 'auto' for resilient failover)",
     )
     run_parser.add_argument("--steps", type=int, default=10, help="Max agent iteration steps")
+    run_parser.add_argument(
+        "--engine",
+        choices=list(ENGINE_LABELS),
+        default=None,
+        help="Agent engine (default: AGENT_ENGINE setting, multi_agent)",
+    )
 
     # seed
     subparsers.add_parser("seed", help="Reset and re-seed database with demonstration data")

@@ -21,6 +21,7 @@ from app.database.engine import get_db, init_db
 from app.database.models import Incident, Order, Customer, Delivery, Courier, AgentMemory, AgentRun
 from app.database.seed import seed_all
 from app.agent.agent import AgentRunner
+from app.agent.engines import ENGINE_LABELS, create_runner, resolve_engine_name
 from app.agent.observer import AgentObserver
 from app.providers.factory import create_provider
 from app.providers.base import LLMProvider, LLMResponse
@@ -371,6 +372,16 @@ with st.sidebar:
         st.session_state["chosen_provider"] = "mock"
         st.caption("🧠 Offline deterministic rule-based runner")
 
+    engine_keys = list(ENGINE_LABELS)
+    chosen_engine = st.selectbox(
+        "Agent engine",
+        options=engine_keys,
+        index=engine_keys.index(resolve_engine_name()),
+        format_func=lambda k: ENGINE_LABELS[k],
+        help="Both engines use the same tools, guardrails, approval step and verification.",
+    )
+    st.session_state["chosen_engine"] = chosen_engine
+
     st.markdown("---")
     st.markdown("#### Demo actions")
     if st.button("Create a failed test order in Shopify", use_container_width=True):
@@ -701,8 +712,12 @@ with tab_orders:
                                 order_id, inc_id = shopify_svc.sync_shopify_order_to_db(o)
                                 AgentRunner.supersede_open_incidents(order_id, keep_incident_id=inc_id)
                                 chosen_prov_name = st.session_state.get("chosen_provider", settings.llm_provider)
-                                box.write(f"Investigating with the `{chosen_prov_name}` provider. No changes are made until you approve.")
-                                runner = AgentRunner(provider=create_provider(chosen_prov_name), max_steps=8)
+                                box.write(
+                                    f"Investigating with {ENGINE_LABELS[st.session_state.get('chosen_engine', resolve_engine_name())]} "
+                                    f"and the `{chosen_prov_name}` provider. No changes are made until you approve."
+                                )
+                                engine = st.session_state.get("chosen_engine", resolve_engine_name())
+                                runner = create_runner(engine=engine, provider=create_provider(chosen_prov_name), max_steps=8)
                                 try:
                                     res = runner.resolve_incident(inc_id, plan_only=True)
                                 except ValueError as claim_err:

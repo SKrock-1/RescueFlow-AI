@@ -37,7 +37,12 @@ class NvidiaProvider(LLMProvider):
         try:
             from openai import OpenAI
             self._client = (
-                OpenAI(base_url=self.base_url, api_key=self.api_key)
+                OpenAI(
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    timeout=settings.llm_timeout_seconds,
+                    max_retries=0,
+                )
                 if self.api_key
                 else None
             )
