@@ -22,6 +22,7 @@ class AgentStatus(str, Enum):
     EVALUATING = "EVALUATING"
     ACTING = "ACTING"
     VERIFYING = "VERIFYING"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
     RESOLVED = "RESOLVED"
     ESCALATED = "ESCALATED"
     FAILED = "FAILED"
@@ -33,18 +34,25 @@ VALID_TRANSITIONS: dict[AgentStatus, set[AgentStatus]] = {
         AgentStatus.INVESTIGATING,
         AgentStatus.EVALUATING,
         AgentStatus.ACTING,
+        AgentStatus.AWAITING_APPROVAL,
         AgentStatus.ESCALATED,
         AgentStatus.FAILED,
     },
     AgentStatus.EVALUATING: {
         AgentStatus.EVALUATING,
         AgentStatus.ACTING,
+        AgentStatus.AWAITING_APPROVAL,
         AgentStatus.ESCALATED,
         AgentStatus.FAILED,
     },
     AgentStatus.ACTING: {
         AgentStatus.VERIFYING,
+        AgentStatus.AWAITING_APPROVAL,
         AgentStatus.ESCALATED,
+        AgentStatus.FAILED,
+    },
+    AgentStatus.AWAITING_APPROVAL: {
+        AgentStatus.ACTING,
         AgentStatus.FAILED,
     },
     AgentStatus.VERIFYING: {

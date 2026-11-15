@@ -74,10 +74,11 @@ def _run_autonomous_rescue(order_id_or_name: str | int, reason: str) -> None:
         ord_num = str(order_data.get("name", "")).replace("#", "")
         shopify_svc.push_resolution_to_shopify(
             local_order_number=f"SHP-{ord_num}",
-            action=str(result.action_taken or "RESOLVED"),
+            action=str(result.action_taken or "none"),
             summary=result.decision_summary or "Autonomous resolution committed via webhook trigger.",
+            status=result.status,
         )
-        logger.info("Successfully completed autonomous rescue for order %s!", ord_num)
+        logger.info("Autonomous rescue for order %s finished with status %s.", ord_num, result.status)
     except Exception as exc:
         logger.exception("Error in background rescue task: %s", exc)
 

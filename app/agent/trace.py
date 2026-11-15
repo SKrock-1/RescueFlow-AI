@@ -59,7 +59,7 @@ class AgentTrace:
                     tool_name=tool_name,
                     arguments=json.dumps(arguments, default=str) if arguments else None,
                     result=json.dumps(result, default=str) if result else None,
-                    decision=summary if event_type == "decision" else None,
+                    decision=summary,
                     timestamp=datetime.now(timezone.utc),
                 )
                 db.add(run_entry)

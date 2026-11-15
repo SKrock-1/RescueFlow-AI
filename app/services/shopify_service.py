@@ -24,6 +24,11 @@ from app.config import get_settings
 logger = logging.getLogger("rescueflow.shopify")
 
 
+# RescueFlow state tags written to Shopify; only one is kept on an order at a time.
+RESCUEFLOW_STATE_TAGS = ("rescueflow-rescued", "rescueflow-escalated")
+OUTCOME_STATE_TAGS = {"RESOLVED": "rescueflow-rescued", "ESCALATED": "rescueflow-escalated"}
+
+
 class ShopifyService:
     """Client for interacting with Shopify Admin REST API."""
 
@@ -119,11 +124,13 @@ class ShopifyService:
         action: str,
         note_message: str,
         extra_tags: list[str] | None = None,
+        state_tag: str = "rescueflow-rescued",
     ) -> dict[str, Any]:
         """
-        Update a live Shopify order with autonomous rescue metadata:
-        - Appends 'rescueflow-rescued' and action tag to order tags
-        - Appends resolution summary to order notes
+        Update a live Shopify order with rescue metadata:
+        - Replaces any earlier RescueFlow state tag with ``state_tag``
+          (rescueflow-rescued or rescueflow-escalated) and adds the action tag
+        - Appends the resolution summary to the order note
         """
         # First retrieve existing tags so we don't overwrite them
         current = self.get_order(order_id)
@@ -132,7 +139,8 @@ class ShopifyService:
 
         existing_tags = current["order"].get("tags", "")
         tags_set = set(t.strip() for t in existing_tags.split(",") if t.strip())
-        tags_set.add("rescueflow-rescued")
+        tags_set -= set(RESCUEFLOW_STATE_TAGS)
+        tags_set.add(state_tag)
         tags_set.add(f"rf-{action.lower()}")
         if extra_tags:
             for t in extra_tags:
@@ -326,14 +334,18 @@ class ShopifyService:
         first_name = cust_data.get("first_name") or ship_data.get("first_name") or "Shopify"
         last_name = cust_data.get("last_name") or ship_data.get("last_name") or "Customer"
         full_name = f"{first_name} {last_name}".strip()
-        phone = cust_data.get("phone") or ship_data.get("phone") or "+919876543210"
+        # No placeholder phone: a missing number must block customer messages, not reach a stranger.
+        phone = cust_data.get("phone") or ship_data.get("phone") or ""
         email = cust_data.get("email") or "customer@example.com"
 
         profile_intel = self.extract_shopify_customer_profile(order_raw)
 
         with get_db() as db:
             # 1. Find or create customer
-            customer = db.query(Customer).filter(Customer.phone == phone).first()
+            if phone:
+                customer = db.query(Customer).filter(Customer.phone == phone).first()
+            else:
+                customer = db.query(Customer).filter(Customer.email == email, Customer.name == full_name).first()
             if not customer:
                 customer = Customer(
                     name=full_name,
@@ -464,10 +476,19 @@ class ShopifyService:
         local_order_number: str,
         action: str,
         summary: str,
+        status: str = "RESOLVED",
     ) -> dict[str, Any]:
-        """Check if local order is a Shopify order and update live store."""
+        """Write a verified outcome back to the Shopify order.
+
+        Only RESOLVED and ESCALATED outcomes are written. Failed, rejected or
+        pending runs leave the Shopify order untouched, so the store never
+        shows a rescue that did not happen.
+        """
         if not local_order_number.startswith("SHP-"):
             return {"skipped": "Not a Shopify order"}
+        state_tag = OUTCOME_STATE_TAGS.get(status.upper())
+        if state_tag is None:
+            return {"skipped": f"Outcome {status} is not written to Shopify"}
 
         raw_num = local_order_number.replace("SHP-", "")
         # Find order by name in Shopify
@@ -487,6 +508,7 @@ class ShopifyService:
             action=action,
             note_message=summary,
             extra_tags=["autonomous-resolution"],
+            state_tag=state_tag,
         )
 
 

@@ -10,6 +10,7 @@ A dedicated Shopify Operations Console connecting directly to Shopify Admin REST
 
 from __future__ import annotations
 
+import html
 import json
 import time
 from datetime import datetime, date
@@ -23,8 +24,19 @@ from app.agent.agent import AgentRunner
 from app.agent.observer import AgentObserver
 from app.providers.factory import create_provider
 from app.providers.base import LLMProvider, LLMResponse
+from app.providers.mock_provider import MockProvider
 from app.services.shopify_service import get_shopify_service
 from app.schemas.models import TraceEvent
+from app.services.rescue_view import (
+    describe_proposal,
+    last_notification,
+    latest_incident,
+    local_order_number,
+    message_preview,
+    proposal_checks,
+    shopify_preview,
+    state_label,
+)
 
 # Page configuration
 st.set_page_config(
@@ -151,7 +163,14 @@ st.markdown("""
     .kpi-card-luxury.green::before { background: linear-gradient(90deg, #10B981, #059669); }
     .kpi-card-luxury.amber::before { background: linear-gradient(90deg, #F59E0B, #D97706); }
     .kpi-card-luxury.blue::before { background: linear-gradient(90deg, #3B82F6, #2563EB); }
-    .kpi-card-luxury.purple::before { background: linear-gradient(90deg, #8B5CF6, #6D28D9); }
+    .kpi-card-luxury.gray::before { background: #94A3B8; }
+
+    /* Run-state chips: text always names the state; colour only supports it */
+    .chip-state-green { background: #ECFDF5 !important; color: #065F46 !important; border-color: #A7F3D0 !important; font-weight: 700 !important; }
+    .chip-state-blue { background: #EFF6FF !important; color: #1E40AF !important; border-color: #BFDBFE !important; font-weight: 700 !important; }
+    .chip-state-orange { background: #FFF7ED !important; color: #9A3412 !important; border-color: #FED7AA !important; font-weight: 700 !important; }
+    .chip-state-red { background: #FEF2F2 !important; color: #991B1B !important; border-color: #FECACA !important; font-weight: 700 !important; }
+    .chip-state-gray { background: #F1F5F9 !important; color: #334155 !important; border-color: #CBD5E1 !important; font-weight: 700 !important; }
 
     .kpi-val {
         font-size: 2rem;
@@ -293,6 +312,12 @@ st.markdown("""
 
 init_db()
 shopify_svc = get_shopify_service()
+store_conn = (
+    shopify_svc.test_connection()
+    if shopify_svc.is_configured
+    else {"success": False, "error": "Shopify is not configured in .env."}
+)
+store_connected = bool(store_conn.get("success"))
 
 # ── Sidebar Configuration ──────────────────────────────────────────────────
 with st.sidebar:
@@ -301,31 +326,23 @@ with st.sidebar:
         <span style="font-size: 1.8rem;">🛍️</span>
         <div>
             <h3 style="margin:0; font-size:1.2rem; font-weight:800; color:#0F172A;">RescueFlow AI</h3>
-            <span style="font-size:0.75rem; color:#64748B; font-weight:600;">Shopify Enterprise App</span>
+            <span style="font-size:0.75rem; color:#64748B; font-weight:600;">Delivery rescue console</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
     st.markdown("---")
 
-    st.markdown("#### 🟢 Connected Store")
-    if shopify_svc.is_configured:
-        conn = shopify_svc.test_connection()
-        if conn.get("success"):
-            st.markdown(f"**Store:** `{conn.get('name')}`")
-            st.markdown(f"**Domain:** `{conn.get('domain')}`")
-            st.markdown("""
-            <div style="margin: 8px 0;">
-                <span class="store-badge"><span class="pulse-dot"></span> Live Sync Active</span>
-            </div>
-            """, unsafe_allow_html=True)
-            st.link_button("🌐 Open Shopify Store Admin", f"https://{shopify_svc.store_url}/admin", use_container_width=True)
-        else:
-            st.error(f"Shopify Error: {conn.get('error')}")
+    st.markdown("#### Shopify store")
+    if store_connected:
+        st.markdown(f"**Store:** `{store_conn.get('name')}`")
+        st.markdown(f"**Domain:** `{store_conn.get('domain')}`")
+        st.caption("Connected: the store answered a test request when this page loaded.")
+        st.link_button("Open Shopify Admin", f"https://{shopify_svc.store_url}/admin", use_container_width=True)
     else:
-        st.warning("Shopify not configured in .env")
+        st.error(f"Not connected. {store_conn.get('error', '')}")
 
     st.markdown("---")
-    st.markdown("#### 🤖 Autonomous AI Engine")
+    st.markdown("#### AI provider")
     settings = get_settings()
     provider_options = [
         "⚡ Auto-Failover (Resilient Multi-Provider)",
@@ -355,8 +372,8 @@ with st.sidebar:
         st.caption("🧠 Offline deterministic rule-based runner")
 
     st.markdown("---")
-    st.markdown("#### ⚡ Quick Demonstration Actions")
-    if st.button("➕ Push New Failed Delivery to Shopify", use_container_width=True):
+    st.markdown("#### Demo actions")
+    if st.button("Create a failed test order in Shopify", use_container_width=True):
         with st.spinner("Calling Shopify Admin REST API..."):
             new_o = shopify_svc.create_test_order(
                 customer_name="Priya Patel",
@@ -371,11 +388,11 @@ with st.sidebar:
             time.sleep(1)
             st.rerun()
 
-    if st.button("🔄 Sync & Refresh All Orders", use_container_width=True):
+    if st.button("Refresh orders", use_container_width=True):
         st.rerun()
 
 # ── Header Banner ──────────────────────────────────────────────────────────
-store_domain = shopify_svc.store_url if shopify_svc.is_configured else "rescueflow-demo-store.myshopify.com"
+store_domain = shopify_svc.store_url if store_connected else "Not connected to Shopify"
 
 st.markdown(f"""
 <div class="hero-banner">
@@ -389,12 +406,9 @@ st.markdown(f"""
         </p>
     </div>
     <div style="text-align: right;">
-        <span class="store-badge">
-            <span class="pulse-dot"></span>
-            {store_domain}
-        </span>
+        <span class="store-badge">{html.escape(store_domain)}</span>
         <div style="font-size: 0.75rem; color: #94A3B8; margin-top: 6px; font-family: monospace;">
-            Admin REST API 2024-01 • Sub-second Webhook Dispatch
+            Shopify Admin REST API 2024-01
         </div>
     </div>
 </div>
@@ -402,190 +416,297 @@ st.markdown(f"""
 
 # ── Top Level Navigation Tabs ──────────────────────────────────────────────
 tab_orders, tab_trace, tab_fleet = st.tabs([
-    "🛍️ Shopify Orders & Live Rescue",
-    "🤖 Agent Reasoning & Execution Trace",
-    "🚚 Fleet Couriers & Customer Memory",
+    "Orders",
+    "Agent trace",
+    "Fleet and memory",
 ])
 
 # ───────────────────────────────────────────────────────────────────────────
 # TAB 1: SHOPIFY ORDERS & LIVE RESCUE
 # ───────────────────────────────────────────────────────────────────────────
 with tab_orders:
-    # Fetch live orders from Shopify
-    live_orders = shopify_svc.list_orders(limit=20)
-    total_orders = len(live_orders)
-    rescued_count = sum(1 for o in live_orders if "rescueflow-rescued" in o.get("tags", ""))
-    pending_count = total_orders - rescued_count
+    live_orders = shopify_svc.list_orders(limit=20) if store_connected else []
+    order_rows = []
+    for o in live_orders:
+        num = local_order_number(o)
+        order_rows.append((o, num, latest_incident(num)))
 
-    # Luxury KPI Metric Cards
+    def _status_of(row):
+        return row[2]["status"] if row[2] else None
+
+    to_plan_states = {None, "OPEN", "FAILED", "REJECTED"}
+    count_to_plan = sum(1 for r in order_rows if _status_of(r) in to_plan_states)
+    count_awaiting = sum(1 for r in order_rows if _status_of(r) == "AWAITING_APPROVAL")
+    count_rescued = sum(1 for r in order_rows if _status_of(r) == "RESOLVED")
+    count_escalated = sum(1 for r in order_rows if _status_of(r) == "ESCALATED")
+
     st.markdown(f"""
     <div class="metric-grid">
+        <div class="kpi-card-luxury amber">
+            <div class="kpi-val">{count_to_plan}</div>
+            <div class="kpi-lbl">To plan</div>
+        </div>
         <div class="kpi-card-luxury blue">
-            <div class="kpi-val">{total_orders}</div>
-            <div class="kpi-lbl">Active Store Orders</div>
+            <div class="kpi-val">{count_awaiting}</div>
+            <div class="kpi-lbl">Awaiting approval</div>
         </div>
         <div class="kpi-card-luxury green">
-            <div class="kpi-val" style="color: #059669;">{rescued_count}</div>
-            <div class="kpi-lbl">Rescued Autonomously</div>
+            <div class="kpi-val">{count_rescued}</div>
+            <div class="kpi-lbl">Rescued, verified</div>
         </div>
-        <div class="kpi-card-luxury amber">
-            <div class="kpi-val" style="color: #D97706;">{pending_count}</div>
-            <div class="kpi-lbl">Pending Exceptions (NDR)</div>
-        </div>
-        <div class="kpi-card-luxury purple">
-            <div class="kpi-val" style="color: #7C3AED;">100%</div>
-            <div class="kpi-lbl">2-Way API Sync Rate</div>
+        <div class="kpi-card-luxury gray">
+            <div class="kpi-val">{count_escalated}</div>
+            <div class="kpi-lbl">Escalated to ops</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
+    st.caption(f"Counts cover the {len(order_rows)} most recent Shopify orders and come from stored incident records.")
 
     col_left, col_right = st.columns([3, 2])
 
     with col_left:
-        st.markdown("### 📦 Real-Time Shopify Order Stream")
-        st.caption("Direct feed from your Shopify store via Admin REST API. Click **Run Autonomous Rescue** to trigger the AI agent:")
+        st.markdown("### Failed deliveries")
+        st.caption("Plan a rescue to let the agent investigate. Nothing changes in Shopify or reaches the customer until you approve the plan.")
 
-        # Filter option
-        filter_status = st.radio("Filter Orders:", ["All Orders", "Pending Exception (NDR)", "Rescued by Agent"], horizontal=True)
+        if not store_connected:
+            st.warning(f"Not connected to Shopify, so no orders can be loaded. {store_conn.get('error', '')}")
 
-        filtered_orders = []
-        for o in live_orders:
+        filter_status = st.radio(
+            "Show",
+            ["All", "To plan", "Awaiting approval", "Done"],
+            horizontal=True,
+        )
+        filter_map = {
+            "To plan": to_plan_states,
+            "Awaiting approval": {"AWAITING_APPROVAL"},
+            "Done": {"RESOLVED", "ESCALATED"},
+        }
+        filtered_rows = [
+            r for r in order_rows
+            if filter_status == "All" or _status_of(r) in filter_map[filter_status]
+        ]
+
+        if store_connected and not filtered_rows:
+            st.info(f"No orders in '{filter_status}'. Create a test order with the form beside this list.")
+
+        for o, local_num, inc in filtered_rows:
+            order_num = o.get("name", f"#{o.get('id')}")
+            cust = o.get("customer") or {}
+            cust_name = f"{cust.get('first_name') or ''} {cust.get('last_name') or ''}".strip() or "Guest customer"
+            initials = "".join(part[0].upper() for part in cust_name.split()[:2]) or "SH"
+            cust_phone = cust.get("phone") or (o.get("shipping_address") or {}).get("phone") or ""
+            total_price = o.get("total_price", "0.00")
+            currency = o.get("currency", "USD")
+            financial = str(o.get("financial_status") or "").upper()
             tags = o.get("tags", "")
-            is_rescued = "rescueflow-rescued" in tags or "autonomous-resolution" in tags
-            if filter_status == "Pending Exception (NDR)" and is_rescued:
-                continue
-            if filter_status == "Rescued by Agent" and not is_rescued:
-                continue
-            filtered_orders.append(o)
+            note = o.get("note", "")
+            status = inc["status"] if inc else None
+            state_text, state_color = state_label(status)
+            oid = o["id"]
+            financial_html = (
+                f'<span style="background: #F1F5F9; color: #334155; font-size: 0.75rem; font-weight: 700; '
+                f'padding: 2px 8px; border-radius: 4px;">{html.escape(financial)}</span>'
+                if financial else ""
+            )
+            phone_html = html.escape(cust_phone) if cust_phone else "No phone on file"
 
-        if not filtered_orders:
-            st.info("No orders found for this filter. Create a new test order using the panel on the right!")
-        else:
-            for o in filtered_orders:
-                order_num = o.get("name", f"#{o.get('id')}")
-                cust = o.get("customer") or {}
-                cust_name = f"{cust.get('first_name', '')} {cust.get('last_name', '')}".strip() or "Guest Customer"
-                initials = "".join([part[0].upper() for part in cust_name.split()[:2]]) if cust_name else "SH"
-                cust_phone = cust.get("phone") or o.get("shipping_address", {}).get("phone") or "+919876543210"
-                total_price = o.get("total_price", "0.00")
-                currency = o.get("currency", "USD")
-                tags = o.get("tags", "")
-                note = o.get("note", "")
-
-                is_rescued = "rescueflow-rescued" in tags or "autonomous-resolution" in tags
-
-                with st.container():
-                    st.markdown(f"""
-                    <div class="order-box">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem;">
-                            <div style="display: flex; align-items: center; gap: 12px;">
-                                <div class="order-avatar">{initials}</div>
-                                <div>
-                                    <div style="display: flex; align-items: center; gap: 8px;">
-                                        <h3 style="margin:0; font-size: 1.25rem; font-weight: 800; color: #0F172A;">{order_num}</h3>
-                                        <span style="background: #F1F5F9; color: #475569; font-size: 0.72rem; font-weight: 700; padding: 2px 8px; border-radius: 4px;">PAID</span>
-                                    </div>
-                                    <div style="color: #64748B; font-size: 0.88rem; font-weight: 500;">
-                                        {cust_name} • <span style="font-family: monospace;">{cust_phone}</span>
-                                    </div>
+            with st.container():
+                st.markdown(f"""
+                <div class="order-box">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <div class="order-avatar" aria-hidden="true">{html.escape(initials)}</div>
+                            <div>
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <span style="font-size: 1.25rem; font-weight: 800; color: #0F172A;">{html.escape(order_num)}</span>
+                                    {financial_html}
+                                </div>
+                                <div style="color: #475569; font-size: 0.88rem; font-weight: 500;">
+                                    {html.escape(cust_name)} · <span style="font-family: monospace;">{phone_html}</span>
                                 </div>
                             </div>
-                            <div style="text-align: right;">
-                                <div style="font-size: 1.3rem; font-weight: 800; color: #0F172A; font-family: 'JetBrains Mono', monospace;">
-                                    ${total_price} <span style="font-size: 0.75rem; color: #64748B;">{currency}</span>
-                                </div>
-                                <div style="margin-top: 4px;">
-                                    {"<span class='chip-tag chip-rescued'>● Rescued by AI</span>" if is_rescued else "<span class='chip-tag' style='background:#FEF3C7; color:#92400E; border:1px solid #FDE68A;'>⚠️ Delivery Failed</span>"}
-                                </div>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="font-size: 1.1rem; font-weight: 700; color: #0F172A; font-family: 'JetBrains Mono', monospace;">
+                                {html.escape(str(total_price))} <span style="font-size: 0.75rem; color: #475569;">{html.escape(currency)}</span>
+                            </div>
+                            <div style="margin-top: 4px;">
+                                <span class="chip-tag chip-state-{state_color}" role="status">{html.escape(state_text)}</span>
                             </div>
                         </div>
                     </div>
-                    """, unsafe_allow_html=True)
+                </div>
+                """, unsafe_allow_html=True)
 
-                    # Items preview
-                    items = o.get("line_items", [])
-                    item_str = ", ".join([f"{it.get('title')} (x{it.get('quantity')})" for it in items])
-                    st.markdown(f"**📦 Purchased Items:** `{item_str or 'Items data'}`")
+                flash = st.session_state.pop(f"flash_{oid}", None)
+                if flash:
+                    getattr(st, flash[0])(flash[1])
 
-                    # Live Shopify Tags and Profile Chips
-                    tags_list = [t.strip() for t in tags.split(",") if t.strip()]
-                    is_vip_order = any("vip" in t.lower() for t in tags_list)
-                    is_comm_order = any("commercial" in t.lower() for t in tags_list)
-                    pref_slot_tag = next((t.replace("slot-", "").title() for t in tags_list if t.startswith("slot-")), "Morning")
+                items = o.get("line_items", [])
+                item_str = ", ".join(f"{it.get('title')} (x{it.get('quantity')})" for it in items)
+                if item_str:
+                    st.markdown(f"**Items:** {item_str}")
 
-                    chips_html = []
-                    if is_vip_order:
-                        chips_html.append("<span class='chip-tag' style='background:#FEF3C7; color:#B45309; border:1px solid #FCD34D; font-weight:700;'>👑 VIP Buyer</span>")
-                    chips_html.append(f"<span class='chip-tag' style='background:#EEF2FF; color:#4F46E5; border:1px solid #C7D2FE;'>⏰ Prefers {pref_slot_tag}</span>")
-                    if is_comm_order:
-                        chips_html.append("<span class='chip-tag' style='background:#F1F5F9; color:#475569; border:1px solid #CBD5E1;'>🏢 Office Address</span>")
+                # Shopify profile chips (read from the order's tags)
+                tags_list = [t.strip() for t in tags.split(",") if t.strip()]
+                is_vip_order = any("vip" in t.lower() for t in tags_list)
+                is_comm_order = any("commercial" in t.lower() for t in tags_list)
+                pref_slot_tag = next((t.replace("slot-", "").title() for t in tags_list if t.startswith("slot-")), None)
+                chips_html = []
+                if is_vip_order:
+                    chips_html.append("<span class='chip-tag'>VIP buyer</span>")
+                if pref_slot_tag:
+                    chips_html.append(f"<span class='chip-tag'>Prefers {html.escape(pref_slot_tag)}</span>")
+                if is_comm_order:
+                    chips_html.append("<span class='chip-tag'>Office address</span>")
+                for t in tags_list:
+                    if t.startswith("slot-") or t in ["vip-repeat-buyer", "commercial-address"]:
+                        continue
+                    chips_html.append(f"<span class='chip-tag'>{html.escape(t)}</span>")
+                if chips_html:
+                    st.markdown(f"**Shopify tags:** {' '.join(chips_html)}", unsafe_allow_html=True)
 
-                    for t in tags_list:
-                        if t.startswith("slot-") or t in ["vip-repeat-buyer", "commercial-address"]:
-                            continue
-                        cls = 'chip-rescued' if 'rescueflow' in t else 'chip-action' if 'rf-' in t else ''
-                        chips_html.append(f"<span class='chip-tag {cls}'>{t}</span>")
+                if note:
+                    with st.expander("Checkout note and RescueFlow notes in Shopify"):
+                        st.markdown(note)
 
-                    st.markdown(f"**🏷️ Shopify Profile & Tags:** {' '.join(chips_html)}", unsafe_allow_html=True)
+                # ── State-specific panel ──
+                if status == "AWAITING_APPROVAL":
+                    proposal = AgentRunner.get_pending_proposal(inc["id"])
+                    if proposal:
+                        tool = proposal["tool_name"]
+                        args = proposal["arguments"]
+                        checks = proposal_checks(inc["order_id"], tool, args)
+                        blocked = any(not c.passed and c.blocking for c in checks)
+                        with st.container(border=True):
+                            st.markdown(f"**Proposed change:** {describe_proposal(tool, args)}")
+                            if proposal["rationale"]:
+                                st.caption(f"Agent's reasoning: {proposal['rationale']}")
 
-                    # Order Notes accordion
-                    if note:
-                        with st.expander("📝 View Customer Checkout Note & Profile Synced to Shopify", expanded=is_rescued):
-                            st.markdown(note)
+                            st.markdown("**Policy checks**")
+                            for c in checks:
+                                if c.passed:
+                                    mark = ":green[:material/check_circle: Passed]"
+                                elif c.blocking:
+                                    mark = ":red[:material/cancel: Failed]"
+                                else:
+                                    mark = ":orange[:material/warning: Warning]"
+                                st.markdown(f"{mark} · **{c.label}**. {c.detail}")
 
-                    # WhatsApp Mockup preview if rescued
-                    if is_rescued:
+                            preview = message_preview(inc["order_id"], tool, args)
+                            st.markdown("**Customer message**")
+                            if preview["text"]:
+                                st.caption(f"{preview['channel']} to {preview['recipient']} · {preview['phone']} (simulated send)")
+                                st.markdown("\n".join(f"> {line}" if line else ">" for line in preview["text"].split("\n")))
+                            elif preview["channel"]:
+                                st.warning(preview["note"])
+                            else:
+                                st.caption(preview["note"])
+
+                            sp = shopify_preview(tool)
+                            st.markdown("**Shopify changes if it succeeds**")
+                            st.caption(f"Tags added: {', '.join(sp['tags'])}. Note appended: {sp['note']}")
+
+                            a1, a2 = st.columns(2)
+                            approve = a1.button("Approve and run", key=f"approve_{oid}", type="primary",
+                                                disabled=blocked, use_container_width=True)
+                            reject = a2.button("Reject plan", key=f"reject_{oid}", use_container_width=True)
+                            if blocked:
+                                st.caption("Approve is turned off because a required policy check failed. Reject this plan and plan again.")
+
+                        if approve:
+                            with st.status(f"Running the approved change for {order_num}", expanded=True) as box:
+                                res = AgentRunner(provider=MockProvider()).execute_approved(inc["id"])
+                                outcome_text = state_label(res.status)[0]
+                                box.write(f"Outcome: {outcome_text}. {res.decision_summary}")
+                                ok = res.status in {"RESOLVED", "ESCALATED"}
+                                if ok:
+                                    push = shopify_svc.push_resolution_to_shopify(
+                                        local_order_number=local_num,
+                                        action=str(res.action_taken or "none"),
+                                        summary=res.decision_summary,
+                                        status=res.status,
+                                    )
+                                    shop_msg = (
+                                        f"Shopify update failed: {push['error']}" if "error" in push
+                                        else "Shopify tags and note updated."
+                                    )
+                                else:
+                                    shop_msg = "Shopify was not changed."
+                                box.write(shop_msg)
+                                for n_ in res.notifications:
+                                    box.write(f"{n_['channel'].upper()} message to {n_['recipient']} recorded (simulated send).")
+                                box.update(label=f"{order_num}: {outcome_text}", state="complete" if ok else "error")
+                            st.session_state[f"flash_{oid}"] = ("success" if ok else "error", f"{outcome_text}. {shop_msg}")
+                            st.session_state["last_active_incident_id"] = inc["id"]
+                            st.rerun()
+
+                        if reject:
+                            AgentRunner(provider=MockProvider()).reject_proposal(
+                                inc["id"], "Rejected by operator in the console."
+                            )
+                            st.session_state[f"flash_{oid}"] = ("info", "Plan rejected. Nothing was changed.")
+                            st.rerun()
+
+                elif status == "FAILED":
+                    st.error(f"Failed: {inc['decision']}")
+                elif status == "REJECTED":
+                    st.caption("The last plan was rejected. Nothing was changed.")
+                elif status in {"RESOLVED", "ESCALATED"}:
+                    if inc["decision"]:
+                        (st.success if status == "RESOLVED" else st.info)(inc["decision"])
+                    sent = last_notification(inc["id"])
+                    if sent and sent.get("sent"):
+                        stamp = sent["timestamp"].strftime("%d %b %Y, %H:%M UTC") if sent.get("timestamp") else ""
+                        msg_html = html.escape(sent["message"]).replace("\n", "<br>")
+                        header_html = (
+                            f"{html.escape(sent['channel'].upper())} message to {html.escape(sent['recipient'])} · "
+                            f"{html.escape(sent['contact'])} (simulated send)"
+                        )
                         st.markdown(f"""
                         <div class="whatsapp-card">
-                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
-                                <span style="font-size: 1.1rem;">📲</span>
-                                <span style="font-weight: 700; font-size: 0.82rem; color: #1E3A8A;">Real-Time WhatsApp Dispatch Confirmation</span>
-                            </div>
+                            <div style="font-weight: 700; font-size: 0.82rem; color: #1E3A8A; margin-bottom: 6px;">{header_html}</div>
                             <div class="whatsapp-msg">
-                                Hello <b>{cust_name}</b>, your delivery for Shopify Order <b>{order_num}</b> has been autonomously rescheduled by RescueFlow AI per your <b>{pref_slot_tag}</b> delivery preference. Our assigned courier will contact you prior to arrival.
-                                <div class="whatsapp-meta">
-                                    <span>Just now</span>
-                                    <span style="color: #2563EB; font-weight: bold;">✓✓</span>
-                                </div>
+                                {msg_html}
+                                <div class="whatsapp-meta"><span>{stamp}</span></div>
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
+                    elif sent:
+                        st.caption(sent["reason"])
 
-                    # Action buttons
-                    b1, b2 = st.columns([3, 2])
-                    with b1:
-                        btn_label = "⚡ Re-Run Autonomous Rescue" if is_rescued else f"⚡ Run Autonomous Rescue on {order_num}"
-                        if st.button(btn_label, key=f"btn_rescue_{o['id']}", type="primary", use_container_width=True):
-                            with st.status(f"RescueFlow AI rescuing Shopify Order {order_num}...", expanded=True) as status_box:
-                                st.write("📥 1. Extracting customer profile, VIP tier, and checkout preferences from Shopify...")
+                # ── Actions ──
+                b1, b2 = st.columns([3, 2])
+                with b1:
+                    if status != "AWAITING_APPROVAL":
+                        if status in {"FAILED", "REJECTED"}:
+                            plan_label = "Plan again"
+                        elif status in {"RESOLVED", "ESCALATED"}:
+                            plan_label = "Plan a new rescue"
+                        else:
+                            plan_label = "Plan rescue"
+                        plan_type = "secondary" if status in {"RESOLVED", "ESCALATED"} else "primary"
+                        if st.button(plan_label, key=f"btn_plan_{oid}", type=plan_type, use_container_width=True):
+                            with st.status(f"Planning a rescue for {order_num}", expanded=True) as box:
                                 order_id, inc_id = shopify_svc.sync_shopify_order_to_db(o)
-
+                                AgentRunner.supersede_open_incidents(order_id, keep_incident_id=inc_id)
                                 chosen_prov_name = st.session_state.get("chosen_provider", settings.llm_provider)
-                                active_prov = create_provider(chosen_prov_name)
-                                st.write(f"🧠 2. Initializing Autonomous Plan-Act-Observe loop using `{chosen_prov_name}`...")
-                                runner = AgentRunner(provider=active_prov, max_steps=8)
-                                res = runner.resolve_incident(inc_id)
-
-                                st.write(f"📡 3. Dispatched WhatsApp notice tailored to customer's {pref_slot_tag} preference...")
-                                st.write("🛍️ 4. Calling Shopify Admin REST API to write tags & incident notes...")
-
-                                clean_num = order_num.replace("#", "")
-                                shopify_svc.push_resolution_to_shopify(
-                                    local_order_number=f"SHP-{clean_num}",
-                                    action=str(res.action_taken or "RESOLVED"),
-                                    summary=res.decision_summary or "Order rescued autonomously by RescueFlow AI",
-                                )
-                                status_box.update(label=f"✅ Order {order_num} Rescued & Synchronized with Shopify!", state="complete")
-
+                                box.write(f"Investigating with the `{chosen_prov_name}` provider. No changes are made until you approve.")
+                                runner = AgentRunner(provider=create_provider(chosen_prov_name), max_steps=8)
+                                res = runner.resolve_incident(inc_id, plan_only=True)
+                                if res.status == "AWAITING_APPROVAL":
+                                    box.update(label=f"{order_num}: plan ready for your approval", state="complete")
+                                    flash_msg = ("info", "Plan ready. Review the proposed change below, then approve or reject it.")
+                                else:
+                                    box.update(label=f"{order_num}: {state_label(res.status)[0]}", state="error")
+                                    flash_msg = ("error", res.decision_summary)
+                            st.session_state[f"flash_{oid}"] = flash_msg
                             st.session_state["last_active_incident_id"] = inc_id
-                            st.toast(f"✅ Shopify Order {order_num} tags updated live on Shopify!", icon="🛍️")
-                            time.sleep(1)
                             st.rerun()
+                with b2:
+                    st.link_button("Open in Shopify Admin", f"https://{shopify_svc.store_url}/admin/orders/{oid}", use_container_width=True)
 
-                    with b2:
-                        st.link_button("🌐 Open in Shopify Admin", f"https://{shopify_svc.store_url}/admin/orders/{o['id']}", use_container_width=True)
-
-                    st.markdown("<hr style='margin: 1.5rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
+                st.markdown("<hr style='margin: 1.5rem 0; border: none; border-top: 1px solid #E2E8F0;'/>", unsafe_allow_html=True)
 
     with col_right:
         st.markdown("### ➕ Push Live Test Order to Shopify")
@@ -671,8 +792,8 @@ with tab_orders:
 # TAB 2: AGENT REASONING & EXECUTION TRACE
 # ───────────────────────────────────────────────────────────────────────────
 with tab_trace:
-    st.markdown("### 🔍 Autonomous Plan-Act-Observe Step Log")
-    st.caption("Inspect the exact reasoning, tool parameters, and deterministic policy guardrails executed by RescueFlow AI:")
+    st.markdown("### Agent steps")
+    st.caption("Every step the agent took for an incident: tool calls with their inputs and outputs, proposals, approvals and verification.")
 
     with get_db() as db:
         all_incidents = (
@@ -684,13 +805,16 @@ with tab_trace:
         )
 
     if not all_incidents:
-        st.info("No incidents resolved yet. Click 'Run Autonomous Rescue' on Tab 1 to see the live trace!")
+        st.info("No incidents yet. Plan a rescue on the Orders tab to see its steps here.")
     else:
         inc_options = {
-            f"Incident #{inc.id} | Order {ord_.order_number} | {cust.name} ({inc.status})": inc.id
+            f"Incident #{inc.id} · {ord_.order_number} · {cust.name} · {state_label(inc.status)[0]}": inc.id
             for inc, ord_, cust in all_incidents
         }
-        sel_label = st.selectbox("Select Incident to Inspect:", options=list(inc_options.keys()))
+        inc_keys = list(inc_options.keys())
+        last_id = st.session_state.get("last_active_incident_id")
+        default_idx = next((i for i, k in enumerate(inc_keys) if inc_options[k] == last_id), 0)
+        sel_label = st.selectbox("Incident", options=inc_keys, index=default_idx)
         inspected_inc_id = inc_options[sel_label]
 
         with get_db() as db:
@@ -711,27 +835,27 @@ with tab_trace:
                 <div class="kpi-val" style="font-size: 1.4rem;">{ord_.order_number}</div>
                 <div class="kpi-lbl">Order Number</div>
             </div>
-            <div class="kpi-card-luxury purple">
-                <div class="kpi-val" style="font-size: 1.4rem;">{cust.name}</div>
+            <div class="kpi-card-luxury gray">
+                <div class="kpi-val" style="font-size: 1.4rem;">{html.escape(cust.name)}</div>
                 <div class="kpi-lbl">Customer</div>
             </div>
             <div class="kpi-card-luxury green">
-                <div class="kpi-val" style="font-size: 1.4rem; color: #059669;">{inc.status}</div>
-                <div class="kpi-lbl">Incident Status</div>
+                <div class="kpi-val" style="font-size: 1.4rem;">{state_label(inc.status)[0]}</div>
+                <div class="kpi-lbl">Incident status</div>
             </div>
             <div class="kpi-card-luxury amber">
                 <div class="kpi-val" style="font-size: 1.4rem; color: #D97706;">{len(runs)} Steps</div>
-                <div class="kpi-lbl">Reasoning Steps</div>
+                <div class="kpi-lbl">Steps</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown("#### 📜 Step-by-Step Tool Calling Trace")
+        st.markdown("#### Steps")
         for r in runs:
-            badge_color = "#E0F2FE" if r.action_type == "observation" else "#FEF3C7" if r.action_type == "tool_call" else "#DCFCE7" if r.action_type == "decision" else "#FEE2E2"
-            text_color = "#0369A1" if r.action_type == "observation" else "#92400E" if r.action_type == "tool_call" else "#15803D" if r.action_type == "decision" else "#B91C1C"
-
-            with st.expander(f"Step {r.step_number} • [{r.action_type.upper()}] {r.tool_name or ''} — {r.decision or 'Executing step'}", expanded=True):
+            step_title = " · ".join(
+                part for part in (f"Step {r.step_number}", r.action_type.replace("_", " "), r.tool_name or "", r.decision or "") if part
+            )
+            with st.expander(step_title, expanded=False):
                 if r.arguments:
                     st.markdown("**Tool Arguments:**")
                     st.code(r.arguments, language="json")
@@ -740,12 +864,14 @@ with tab_trace:
                     st.code(r.result, language="json")
 
         if inc.agent_decision:
-            st.markdown("#### 🎯 Verified Resolution Summary")
+            st.markdown("#### Outcome")
             with st.container(border=True):
                 if inc.status == "RESOLVED":
                     st.success(inc.agent_decision)
+                elif inc.status == "FAILED":
+                    st.error(inc.agent_decision)
                 else:
-                    st.warning(inc.agent_decision)
+                    st.info(inc.agent_decision)
 
 # ───────────────────────────────────────────────────────────────────────────
 # TAB 3: FLEET COURIERS & CUSTOMER MEMORY

@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "RescueFlow AI — Delivery NDR Autonomous Resolution Sequence",
+    "output": "docs/rescueflow_sequence.html",
+    "viewBox": [1060, 680],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    { "id": "carrier", "type": "external", "label": "Carrier / Courier", "sublabel": "NDR event" },
+    { "id": "fastapi", "type": "backend", "label": "FastAPI Server", "sublabel": ":8000 /webhooks/ndr" },
+    { "id": "agent", "type": "backend", "label": "RescueFlow Agent", "sublabel": "Plan-Act-Observe" },
+    { "id": "llm", "type": "cloud", "label": "LLM Failover", "sublabel": "NVIDIA / Groq" },
+    { "id": "policy", "type": "security", "label": "Policy Guardrails", "sublabel": "Deterministic Rules" },
+    { "id": "shopify", "type": "external", "label": "Shopify Store", "sublabel": "Admin REST API" },
+    { "id": "customer", "type": "external", "label": "Buyer", "sublabel": "WhatsApp / SMS" }
+  ],
+  "segments": [
+    { "from": 160, "to": 245, "label": "1. Inbound Ingestion" },
+    { "from": 255, "to": 440, "label": "2. Agent Investigation & Guardrails" },
+    { "from": 450, "to": 570, "label": "3. Resolution & 2-Way Sync" }
+  ],
+  "messages": [
+    { "id": "m1", "from": "carrier", "to": "fastapi", "y": 170, "label": "POST /webhooks/ndr (unreachable)", "variant": "emphasis" },
+    { "id": "m2", "from": "fastapi", "to": "carrier", "y": 200, "label": "202 Accepted", "variant": "return" },
+    { "id": "m3", "from": "fastapi", "to": "agent", "y": 230, "label": "dispatch async rescue task", "variant": "emphasis" },
+    { "id": "m4", "from": "agent", "to": "shopify", "y": 265, "label": "fetch order + customer tags", "variant": "default" },
+    { "id": "m5", "from": "shopify", "to": "agent", "y": 295, "label": "VIP buyer, slot-afternoon, office", "variant": "return" },
+    { "id": "m6", "from": "agent", "to": "llm", "y": 330, "label": "reason next action (tools)", "variant": "default" },
+    { "id": "m7", "from": "llm", "to": "agent", "y": 360, "label": "call: reschedule_delivery(14:00-17:00)", "variant": "return" },
+    { "id": "m8", "from": "agent", "to": "policy", "y": 395, "label": "verify business hours & load limit", "variant": "security" },
+    { "id": "m9", "from": "policy", "to": "agent", "y": 425, "label": "action validated (within SLA)", "variant": "return" },
+    { "id": "m10", "from": "agent", "to": "shopify", "y": 460, "label": "PUT /orders: tags + resolution note", "variant": "emphasis" },
+    { "id": "m11", "from": "shopify", "to": "agent", "y": 490, "label": "200 OK (2-way sync verified)", "variant": "return" },
+    { "id": "m12", "from": "agent", "to": "customer", "y": 525, "label": "dispatch WhatsApp reschedule notice", "variant": "emphasis" },
+    { "id": "m13", "from": "customer", "to": "agent", "y": 555, "label": "delivery confirmed", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "fastapi", "from": 170, "to": 235, "type": "backend" },
+    { "participant": "agent", "from": 230, "to": 560, "type": "backend" },
+    { "participant": "shopify", "from": 265, "to": 300, "type": "external" },
+    { "participant": "llm", "from": 330, "to": 365, "type": "cloud" },
+    { "participant": "policy", "from": 395, "to": 430, "type": "security" },
+    { "participant": "shopify", "from": 460, "to": 495, "type": "external" },
+    { "participant": "customer", "from": 525, "to": 560, "type": "external" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Sub-Second Ingestion",
+      "items": [
+        "Carrier sends Non-Delivery Report (NDR) webhook",
+        "FastAPI acknowledges immediately with HTTP 202",
+        "Asynchronous task queued in BackgroundTasks"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Autonomous Investigation",
+      "items": [
+        "Agent pulls customer profile and preferences from Shopify",
+        "LLM reasons with tool calling over viable courier slots",
+        "Deterministic policy guardrail prevents out-of-hours actions"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Closed-Loop Execution",
+      "items": [
+        "Two-way synchronization tags live Shopify order",
+        "Customer notified via WhatsApp with one-tap confirmation"
+      ]
+    }
+  ]
+}

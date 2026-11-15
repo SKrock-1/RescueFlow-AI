@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "RescueFlow AI — Autonomous System Architecture",
+    "output": "docs/rescueflow_architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    { "id": "shopify_webhook", "type": "external", "label": "Carrier & Shopify NDR", "sublabel": "Webhooks (HTTP POST)", "pos": [40, 240], "size": [150, 64], "tag": "Event Trigger" },
+    { "id": "streamlit_ui", "type": "frontend", "label": "Operations Console", "sublabel": "Streamlit :8501", "pos": [40, 100], "size": [150, 64], "tag": "Merchant UI" },
+    { "id": "fastapi_server", "type": "backend", "label": "Webhook Engine", "sublabel": "FastAPI :8000", "pos": [260, 240], "size": [150, 64], "tag": "Async Worker" },
+    { "id": "agent_runner", "type": "backend", "label": "RescueFlow Agent", "sublabel": "Plan-Act-Observe Loop", "pos": [480, 240], "size": [160, 64], "tag": "Core Reasoner" },
+    { "id": "llm_failover", "type": "cloud", "label": "LLM Failover Chain", "sublabel": "NVIDIA ➔ Groq ➔ Mock", "pos": [480, 80], "size": [160, 64], "tag": "Circuit Breaker" },
+    { "id": "guardrails", "type": "security", "label": "Policy Guardrails", "sublabel": "SLA & Business Rules", "pos": [480, 400], "size": [160, 64], "tag": "Deterministic" },
+    { "id": "tools_registry", "type": "backend", "label": "Python Tool Registry", "sublabel": "8 Inspection & Actions", "pos": [710, 240], "size": [160, 64], "tag": "Mutations" },
+    { "id": "sqlite_db", "type": "database", "label": "Operational DB & Memory", "sublabel": "SQLite WAL Engine", "pos": [710, 400], "size": [160, 64], "tag": "Persistent State" },
+    { "id": "shopify_api", "type": "external", "label": "Shopify Admin API", "sublabel": "2-Way REST Sync", "pos": [940, 180], "size": [150, 64], "tag": "Tags & Notes" },
+    { "id": "notifications", "type": "external", "label": "Customer Notification", "sublabel": "WhatsApp & SMS", "pos": [940, 300], "size": [150, 64], "tag": "Real-time Dispatch" }
+  ],
+  "boundaries": [
+    { "kind": "security-group", "label": "Autonomous Intelligence & Safeguards Core", "wraps": ["agent_runner", "llm_failover", "guardrails", "tools_registry", "sqlite_db"] },
+    { "kind": "region", "label": "E-Commerce Ingestion Layer", "wraps": ["shopify_webhook", "fastapi_server", "streamlit_ui"] }
+  ],
+  "connections": [
+    { "id": "ndr-to-api", "from": "shopify_webhook", "to": "fastapi_server", "label": "NDR payload", "variant": "emphasis" },
+    { "id": "ui-to-agent", "from": "streamlit_ui", "to": "agent_runner", "label": "manual trigger", "variant": "dashed" },
+    { "id": "api-to-agent", "from": "fastapi_server", "to": "agent_runner", "label": "BackgroundTasks", "variant": "emphasis" },
+    { "id": "agent-to-llm", "from": "agent_runner", "to": "llm_failover", "label": "tool call reasoning", "fromSide": "top", "toSide": "bottom" },
+    { "id": "agent-to-policy", "from": "agent_runner", "to": "guardrails", "label": "verify action", "variant": "security", "fromSide": "bottom", "toSide": "top" },
+    { "id": "agent-to-tools", "from": "agent_runner", "to": "tools_registry", "label": "dispatch execution", "variant": "emphasis" },
+    { "id": "tools-to-db", "from": "tools_registry", "to": "sqlite_db", "label": "SQLAlchemy mutations", "fromSide": "bottom", "toSide": "top" },
+    { "id": "tools-to-shopify", "from": "tools_registry", "to": "shopify_api", "label": "REST update", "variant": "emphasis" },
+    { "id": "tools-to-notify", "from": "tools_registry", "to": "notifications", "label": "buyer alert" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Real-Time Ingestion", "items": ["Shopify & courier NDR webhook payloads ingested in <100ms", "Interactive Streamlit console allows live demonstration and manual triage"] },
+    { "dot": "emerald", "title": "Agentic Reasoning & Safeguards", "items": ["Multi-turn Plan-Act-Observe loop investigates context and customer memory", "Multi-provider failover prevents 429 rate limit outages", "Deterministic policy guardrails enforce commercial hours and load limits"] },
+    { "dot": "amber", "title": "Outbound 2-Way Synchronization", "items": ["Live Shopify tags (rf-reschedule_delivery, rescueflow-rescued) written via Admin API", "Customer WhatsApp dispatch confirms preferred delivery time slot"] }
+  ]
+}

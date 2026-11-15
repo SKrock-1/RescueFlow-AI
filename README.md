@@ -2,7 +2,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests: 44 Passing](https://img.shields.io/badge/tests-44%20passed-brightgreen.svg)](tests/)
+[![Tests: 51 Passing](https://img.shields.io/badge/tests-51%20passed-brightgreen.svg)](tests/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.35+-FF4B4B.svg)](https://streamlit.io)
 [![Shopify REST API](https://img.shields.io/badge/Shopify%20API-2024--01-95BF47.svg)](https://shopify.dev/docs/api/admin-rest)
@@ -95,6 +95,24 @@ Operating on a strict **Plan-Act-Observe** agentic loop backed by deterministic 
                      │ Live Shopify Admin API│        │ Customer WhatsApp/SMS │
                      │  (Tags & Audit Notes) │        │ (Interactive Dispatch)│
                      └───────────────────────┘        └───────────────────────┘
+```
+
+### 🌐 Interactive Architecture & Sequence Diagrams (Powered by Archify)
+
+RescueFlow AI includes interactive, validated architecture and workflow sequence diagrams built using **[Archify](https://archify.si)** (validated with `archify check`: 0 proper crossings, strict orthogonal routing, zero warnings/errors):
+
+* 📐 **Interactive System Architecture:** [`docs/rescueflow_architecture.html`](docs/rescueflow_architecture.html) — Inspectable component topology encompassing Carrier NDR Webhooks, FastAPI Async Engine, Autonomous AgentRunner, Deterministic Guardrails, LLM Failover Pool, Shopify 2-Way Sync, and WhatsApp Dispatch.
+* ⚡ **Autonomous NDR Resolution Sequence:** [`docs/rescueflow_sequence.html`](docs/rescueflow_sequence.html) — Animated message trace visualizing inbound failure ingestion, customer profile extraction, LLM tool reasoning, policy enforcement, and live Shopify order tagging.
+
+To regenerate or validate the diagrams locally:
+```bash
+# Render interactive diagrams
+node .agents/skills/archify/bin/archify.mjs render architecture docs/rescueflow.architecture.json docs/rescueflow_architecture.html
+node .agents/skills/archify/bin/archify.mjs render sequence docs/rescueflow_sequence.json docs/rescueflow_sequence.html
+
+# Validate diagrams (0 crossings, single SVG, layout compliance)
+node .agents/skills/archify/bin/archify.mjs check docs/rescueflow_architecture.html
+node .agents/skills/archify/bin/archify.mjs check docs/rescueflow_sequence.html
 ```
 
 ---

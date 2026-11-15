@@ -30,6 +30,30 @@ class NotificationDispatcher:
     """Dispatches multi-channel customer and driver notifications."""
 
     @staticmethod
+    def build_rescheduled_message(
+        customer_name: str, order_number: str, new_date: str, start_time: str, end_time: str
+    ) -> str:
+        """Text of the reschedule message, used for both sending and approval previews."""
+        return (
+            f"📦 *RescueFlow Update for Order {order_number}*\n\n"
+            f"Hi {customer_name}, we missed you during today's delivery attempt.\n\n"
+            f"✅ We have rescheduled your delivery to:\n"
+            f"📅 *Date:* {new_date}\n"
+            f"⏰ *Window:* {start_time} - {end_time}\n\n"
+            f"This window was chosen based on your delivery preferences. "
+            f"Reply 'CHANGE' if you would prefer a different time."
+        )
+
+    @staticmethod
+    def build_escalated_message(order_number: str, phone: str) -> str:
+        """Text of the escalation message, used for both sending and approval previews."""
+        return (
+            f"RescueFlow notice: delivery for order {order_number} could not be completed "
+            f"and has been passed to our logistics support team. "
+            f"A representative will call you at {phone} to arrange delivery."
+        )
+
+    @staticmethod
     def notify_customer_rescheduled(
         customer_name: str,
         phone: str,
@@ -40,14 +64,8 @@ class NotificationDispatcher:
         channel: str = "whatsapp",
     ) -> NotificationMessage:
         """Send delivery rescheduled notification to customer."""
-        msg_text = (
-            f"📦 *RescueFlow Update for Order {order_number}*\n\n"
-            f"Hi {customer_name}, we missed you during today's delivery attempt.\n\n"
-            f"✅ We have automatically rescheduled your delivery to:\n"
-            f"📅 *Date:* {new_date}\n"
-            f"⏰ *Window:* {start_time} - {end_time}\n\n"
-            f"This window was chosen based on your delivery preferences. "
-            f"Reply 'CHANGE' if you would prefer a different time."
+        msg_text = NotificationDispatcher.build_rescheduled_message(
+            customer_name, order_number, new_date, start_time, end_time
         )
 
         notif = NotificationMessage(
@@ -72,11 +90,7 @@ class NotificationDispatcher:
         channel: str = "sms",
     ) -> NotificationMessage:
         """Send incident escalation notification to customer."""
-        msg_text = (
-            f"⚠️ RescueFlow Notice: Delivery for order {order_number} could not be completed "
-            f"and has been escalated to our senior logistics support team. "
-            f"A representative will call you shortly at {phone} to arrange delivery."
-        )
+        msg_text = NotificationDispatcher.build_escalated_message(order_number, phone)
 
         notif = NotificationMessage(
             channel=channel,

@@ -171,8 +171,9 @@ class AgentResult(BaseModel):
     incident_id: int
     order_id: int
     customer_id: int
-    status: str  # RESOLVED / ESCALATED / FAILED
+    status: str  # RESOLVED / ESCALATED / FAILED / AWAITING_APPROVAL / REJECTED
     action_taken: str | None = None
+    proposed_action: dict[str, Any] | None = None
     decision_summary: str
     trace: list[TraceEvent] = Field(default_factory=list)
     candidate_actions: list[CandidateAction] = Field(default_factory=list)
