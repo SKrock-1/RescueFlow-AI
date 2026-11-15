@@ -839,6 +839,26 @@ class AgentRunner:
             )
             memory_updates.append(f"Recorded escalation record in customer #{customer_id} memory.")
 
+        if status in {AgentStatus.RESOLVED, AgentStatus.ESCALATED}:
+            # Episodic memory: searchable by later rescues as a "similar case".
+            try:
+                from app.grounding.memory import record_episode
+
+                with get_db() as db:
+                    inc = db.query(Incident).filter(Incident.id == trace.incident_id).first()
+                    description = (inc.description if inc else "") or ""
+                episode_id = record_episode(
+                    customer_id=customer_id,
+                    incident_id=trace.incident_id,
+                    text=(
+                        f"Order {order_number}: {incident_type}. {description} "
+                        f"Action: {action_name_taken or 'none'}. Outcome: {status.value}. {final_decision_text[:240]}"
+                    ).strip(),
+                )
+                memory_updates.append(f"Stored this rescue as past case memory:{episode_id}.")
+            except Exception as exc:  # memory must never break a finished rescue
+                logger.warning("Could not store episodic memory: %s", exc)
+
         notifications_sent: list[dict[str, Any]] = []
         if status not in {AgentStatus.RESOLVED, AgentStatus.ESCALATED}:
             return memory_updates, notifications_sent

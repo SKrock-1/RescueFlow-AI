@@ -38,11 +38,16 @@ Propose exactly ONE recovery action. If an earlier proposal was rejected, fix th
 Choose from:
 - reschedule_delivery: arguments {"date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM"} taken from a candidate slot
 - escalate_incident: arguments {"reason": "why a person must take over"}
+Ground the plan in the retrieved knowledge (knowledge.sources = policy sections, knowledge.customer_memory,
+knowledge.similar_cases). Cite every source you rely on by its id in square brackets, for example
+[reattempt-policy#attempt-limit] or [memory:12]. Never cite an id that is not in the case file, and never
+contradict a cited policy.
 Reply with ONE JSON object and nothing else:
-{"tool_name": "...", "arguments": {...}, "rationale": "one or two sentences citing the facts you used"}"""
+{"tool_name": "...", "arguments": {...}, "rationale": "one or two sentences with [source-id] citations"}"""
 
 CRITIC = """ROLE: CRITIC
 You are the Policy Critic. Hard policy rules have already been checked by code and passed.
-Review the proposal against the customer's preferences, constraints and the reasoning given.
-Approve unless there is a concrete problem. Reply with ONE JSON object and nothing else:
+Review the proposal against the customer's preferences and constraints, the retrieved policy sections
+(case.knowledge.sources) and the sources the plan cites. Reject a plan that contradicts a retrieved policy
+and name that policy's id in square brackets. Approve unless there is a concrete problem. Reply with ONE JSON object and nothing else:
 {"verdict": "approve | reject", "reason": "one sentence"}"""

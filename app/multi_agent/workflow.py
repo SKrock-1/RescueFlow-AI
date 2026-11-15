@@ -10,7 +10,7 @@ Graph (Agent Framework ``WorkflowBuilder``):
                                                             Policy Critic ┘
                                                                  │ approved
                                                                  ▼
-                                                           Approval gate ── plan-only ──► stop (AWAITING_APPROVAL)
+                                                   Memory Writer ─► Approval gate ── plan-only ──► stop (AWAITING_APPROVAL)
                                                                  │ autonomous
                                                                  ▼
                                                      Execution (only writer) ─► Verifier ─► done
@@ -34,7 +34,8 @@ from agent_framework import Agent, Executor, WorkflowBuilder, WorkflowContext, h
 from app.af.clients import ProviderChatClient
 from app.af.rescue_agent import _run_sync
 from app.agent.agent import AgentRunner, RunContext
-from app.agent.memory import load_customer_memory
+from app.grounding.knowledge import cited_ids, search_knowledge
+from app.grounding.memory import remember_fact, search_customer_memory, search_similar_cases
 from app.database.engine import get_db
 from app.database.models import Incident, Order
 from app.multi_agent import prompts, roles
@@ -51,7 +52,7 @@ from app.multi_agent.case import (
     VerifyRequest,
 )
 from app.providers.base import LLMProvider
-from app.providers.fallback_provider import FallbackProvider
+from app.providers.fallback_provider import FallbackProvider, provider_label
 from app.providers.mock_provider import MockProvider
 from app.schemas.models import AgentResult
 from app.services.guardrails import policy_violation
@@ -69,6 +70,7 @@ AGENT_LABELS = {
     "knowledge": "Knowledge",
     "planner": "Resolution Planner",
     "critic": "Policy Critic",
+    "memory": "Memory Writer",
     "gate": "Approval gate",
     "execution": "Execution",
     "verifier": "Verifier",
@@ -110,17 +112,21 @@ class MultiAgentRescue(AgentRunner):
         used_fallback = answer is None
         if used_fallback:
             answer = fallback()
+        provider = self.provider_for(role)
+        answered_by = getattr(provider, "last_answered_by", None) or provider_label(provider)
         self.note(run, role, answer.get("summary") or answer.get("reason") or answer.get("rationale") or "",
-                  answer, used_fallback=used_fallback)
+                  {**answer, "answered_by": answered_by}, used_fallback=used_fallback, answered_by=answered_by)
         return answer
 
     def note(self, run: RunContext, role: str, summary: str, result: dict[str, Any] | None = None,
-             used_fallback: bool = False, status: str = "success") -> None:
+             used_fallback: bool = False, status: str = "success", answered_by: str | None = None) -> None:
         run.step_counter += 1
         label = AGENT_LABELS.get(role, role)
         text = f"{label}: {summary}".strip().rstrip(":")
         if used_fallback:
             text += " (model reply was not valid JSON; used the built-in rule)"
+        elif answered_by == "offline rules":
+            text += " (answered by offline rules: no AI provider was available)"
         self._record_trace_step(
             trace=run.trace, step_number=run.step_counter, event_type="agent",
             tool_name=role, summary=text, result=result, status=status,
@@ -228,40 +234,71 @@ class LogisticsAgent(_Step):
 
 
 class KnowledgeAgent(_Step):
-    """Past cases and stored memories for this customer (Phase 3 replaces this with pgvector + Mem0)."""
+    """Retrieves the policies (SOP corpus), customer memories and similar past cases for this incident."""
 
     @handler
     async def recall(self, case: RescueCase, ctx: WorkflowContext[Findings]) -> None:
-        memories = load_customer_memory(case.customer_id)[:5]
-        with get_db() as db:
-            past = (
-                db.query(Incident, Order)
-                .join(Order, Incident.order_id == Order.id)
-                .filter(Order.customer_id == case.customer_id, Incident.id != case.incident_id,
-                        Incident.status.in_(["RESOLVED", "ESCALATED"]))
-                .order_by(Incident.id.desc())
-                .limit(3)
-                .all()
-            )
-            past_cases = [
-                {"incident_id": inc.id, "order": order.order_number, "outcome": inc.status,
-                 "decision": (inc.agent_decision or "")[:200]}
-                for inc, order in past
-            ]
+        query = knowledge_query(case)
+        sources = search_knowledge(query, k=4)
+        memories = search_customer_memory(case.customer_id, query, k=4)
+        similar = search_similar_cases(query, exclude_incident_id=case.incident_id, k=3)
         case.knowledge = {
-            "memories": [{"type": m["memory_type"], "content": m["content"]} for m in memories],
-            "similar_cases": past_cases,
+            "query": query,
+            "sources": [_hit(h) for h in sources],
+            "customer_memory": [_hit(h) for h in memories],
+            "similar_cases": [_hit(h) for h in similar],
         }
-        self.engine.note(self.rc, "knowledge",
-                         f"{len(memories)} memory fact(s) and {len(past_cases)} past case(s) for this customer.",
-                         case.knowledge)
+        self.engine.note(
+            self.rc, "knowledge",
+            f"Retrieved {len(sources)} policy section(s), {len(memories)} customer memory item(s) and "
+            f"{len(similar)} similar past case(s): " + ", ".join(f"[{h.id}]" for h in sources + memories + similar),
+            case.knowledge,
+        )
         await ctx.send_message(Findings("knowledge", case))
 
 
+def knowledge_query(case: RescueCase) -> str:
+    triage = case.triage or {}
+    return " ".join(str(part) for part in (
+        triage.get("category", "").replace("_", " "), triage.get("summary", ""),
+        triage.get("customer_request") or "", case.incident_type.replace("_", " "), case.description,
+    ) if part)
+
+
+def _hit(hit) -> dict[str, Any]:
+    return {"id": hit.id, "title": hit.title, "text": hit.text[:600], "score": hit.score}
+
+
+def known_citations(case: RescueCase) -> list[str]:
+    k = case.knowledge or {}
+    return [h["id"] for group in ("sources", "customer_memory", "similar_cases") for h in k.get(group, [])]
+
+
 class MergeFindings(_Step):
+    """Joins the parallel findings and runs a second retrieval pass on what the team learned."""
+
     @handler
     async def merge(self, items: list[Findings], ctx: WorkflowContext[PlanRequest]) -> None:
-        await ctx.send_message(PlanRequest(items[0].case))
+        case = items[0].case
+        context = case.context or {}
+        topics = []
+        if context.get("is_commercial_address"):
+            topics.append("office commercial address business hours reception")
+        if context.get("is_vip"):
+            topics.append("VIP repeat customer priority handling")
+        if int((case.logistics or {}).get("failed_attempts") or 0) >= 2:
+            topics.append("attempt limit escalate after failed attempts")
+        if not (case.logistics or {}).get("candidate_slots"):
+            topics.append("no feasible slot escalate")
+        if topics:
+            have = set(known_citations(case))
+            added = [h for h in search_knowledge(" ".join(topics), k=4) if h.id not in have]
+            if added:
+                case.knowledge.setdefault("sources", []).extend(_hit(h) for h in added)
+                self.engine.note(self.rc, "knowledge",
+                                 "Added policies for the team's findings: " + ", ".join(f"[{h.id}]" for h in added),
+                                 {"topics": topics, "added": [h.id for h in added]})
+        await ctx.send_message(PlanRequest(case))
 
 
 class PlannerAgent(_Step):
@@ -283,7 +320,7 @@ class PlannerAgent(_Step):
             }
             self.engine.note(self.rc, "planner", answer["rationale"], answer)
         else:
-            facts = case.facts()
+            facts = case.planning_facts()
             answer = await self.engine.ask(
                 self.rc, "planner", prompts.PLANNER, facts, "Propose one recovery action.",
                 lambda: roles.planner(facts),
@@ -293,9 +330,20 @@ class PlannerAgent(_Step):
                 self.engine.note(self.rc, "planner", "Reply named no usable action; used the built-in rule.", answer)
         args = dict(answer["arguments"])
         args["order_id"] = case.order_id  # an agent may only act on its own incident's order
+        rationale = str(answer.get("rationale") or "").strip()
+        known = known_citations(case)
+        cited = [c for c in cited_ids(rationale) if c in known]
+        if not cited:
+            # Every decision must be grounded: attach the most relevant retrieved sources.
+            fallback_ids = [h["id"] for h in (case.knowledge or {}).get("sources", [])[:2]]
+            if fallback_ids:
+                rationale = f"{rationale} Sources: " + ", ".join(f"[{c}]" for c in fallback_ids)
+                self.engine.note(self.rc, "planner", "Plan cited no retrieved source; attached the top policy sources.",
+                                 {"added_citations": fallback_ids})
+                cited = fallback_ids
         case.proposals.append(Proposal(
             tool_name=answer["tool_name"], arguments=args,
-            rationale=str(answer.get("rationale") or ""), version=len(case.proposals) + 1,
+            rationale=rationale, version=len(case.proposals) + 1, citations=cited,
         ))
         await ctx.send_message(ProposalMade(case))
 
@@ -316,7 +364,7 @@ class CriticAgent(_Step):
             self.engine.note(self.rc, "critic", f"Rejected plan v{proposal.version}. {reason}",
                              {"verdict": "reject", "reason": reason, "checks": check_rows}, status="error")
         else:
-            facts = {"case": case.facts(), "proposal": {
+            facts = {"case": case.planning_facts(), "proposal": {
                 "version": proposal.version, "tool_name": proposal.tool_name,
                 "arguments": proposal.arguments, "rationale": proposal.rationale}}
             answer = await self.engine.ask(
@@ -328,6 +376,40 @@ class CriticAgent(_Step):
 
         case.reviews.append(review)
         await ctx.send_message(Approved(case) if review.approved else Rejected(case))
+
+
+class MemoryWriter(_Step):
+    """Stores what this case taught about the customer (ADD / UPDATE / NOOP)."""
+
+    @handler
+    async def write(self, approved: Approved, ctx: WorkflowContext[Approved]) -> None:
+        case = approved.case
+        changes = []
+        for key, content in customer_facts(case):
+            change = remember_fact(case.customer_id, content, key=key, incident_id=case.incident_id)
+            changes.append({"action": change.action, "memory": f"memory:{change.memory_id}",
+                            "content": change.content, "replaced": change.replaced})
+        summary = ", ".join(f"{c['action']} {c['memory']}" for c in changes) or "nothing new to remember"
+        self.engine.note(self.rc, "memory", f"Customer memory: {summary}.", {"changes": changes})
+        await ctx.send_message(approved)
+
+
+def customer_facts(case: RescueCase) -> list[tuple[str, str]]:
+    """Facts worth remembering about the customer, keyed so newer values replace older ones."""
+    context, triage = case.context or {}, case.triage or {}
+    facts = []
+    if context.get("preferred_window"):
+        facts.append(("preferred_window", f"Prefers {context['preferred_window']} deliveries."))
+    if context.get("is_commercial_address"):
+        facts.append(("address_note", "Commercial address: deliver on weekdays between 09:00 and 18:00."))
+    if context.get("is_vip"):
+        facts.append(("vip_status", "VIP or repeat buyer: prioritise the earliest matching slot."))
+    constraints = [c for c in context.get("constraints", []) if isinstance(c, str) and "09:00-18:00" not in c]
+    if constraints:
+        facts.append(("delivery_instructions", "; ".join(constraints)[:300]))
+    if triage.get("customer_request"):
+        facts.append(("customer_request", f"Asked for: {triage['customer_request']}"))
+    return facts
 
 
 class ApprovalGate(_Step):
@@ -396,6 +478,7 @@ def build_workflow(engine: MultiAgentRescue, run: RunContext):
     merge = MergeFindings("merge", engine, run)
     planner = PlannerAgent("planner", engine, run)
     critic = CriticAgent("critic", engine, run)
+    memory = MemoryWriter("memory", engine, run)
     gate = ApprovalGate("gate", engine, run)
     execution = ExecutionAgent("execution", engine, run)
     verifier = VerifierAgent("verifier", engine, run)
@@ -408,7 +491,8 @@ def build_workflow(engine: MultiAgentRescue, run: RunContext):
         .add_edge(merge, planner)
         .add_edge(planner, critic)
         .add_edge(critic, planner, condition=lambda message: isinstance(message, Rejected))
-        .add_edge(critic, gate, condition=lambda message: isinstance(message, Approved))
+        .add_edge(critic, memory, condition=lambda message: isinstance(message, Approved))
+        .add_edge(memory, gate)
         .add_edge(gate, execution)
         .add_edge(execution, verifier)
         .build()

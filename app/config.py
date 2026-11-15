@@ -54,6 +54,9 @@ class Settings(BaseSettings):
         default=10, description="Maximum iterations for the agent loop"
     )
     agent_log_level: str = Field(default="INFO", description="Logging level")
+    embeddings_backend: Literal["hashing", "fastembed"] = Field(
+        default="hashing", description="Retrieval embeddings: built-in hashing (no download) or fastembed"
+    )
     llm_timeout_seconds: float = Field(
         default=30.0, description="Per-request timeout for NVIDIA/Groq calls, so a slow endpoint fails over"
     )

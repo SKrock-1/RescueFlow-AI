@@ -118,7 +118,28 @@ def _rejected_windows(case: dict[str, Any]) -> set[tuple[str, str]]:
     return out
 
 
+def _cite(case: dict[str, Any], *preferred: str) -> str:
+    """Citations for offline plans: the preferred policy ids that were retrieved, else the top sources."""
+    sources = [s["id"] for s in (case.get("knowledge") or {}).get("sources", [])]
+    picked = [p for p in preferred if p in sources] or sources[:2]
+    return (" " + " ".join(f"[{p}]" for p in picked)) if picked else ""
+
+
 def planner(case: dict[str, Any]) -> dict[str, Any]:
+    answer = _plan(case)
+    if answer["tool_name"] == "escalate_incident":
+        cites = _cite(case, "reattempt-policy#attempt-limit", "escalation-matrix#when-to-escalate")
+    else:
+        preferred = ["ndr-handling#customer-request"] if (case.get("triage") or {}).get("customer_request") else []
+        preferred += ["ndr-handling#customer-unavailable", "reattempt-policy#choosing-a-slot"]
+        if (case.get("customer_context") or {}).get("is_commercial_address"):
+            preferred.insert(0, "office-delivery#business-hours-only")
+        cites = _cite(case, *preferred)
+    answer["rationale"] = answer["rationale"] + cites
+    return answer
+
+
+def _plan(case: dict[str, Any]) -> dict[str, Any]:
     logistics_ = case.get("logistics") or {}
     ctx = case.get("customer_context") or {}
     triage_ = case.get("triage") or {}

@@ -239,3 +239,27 @@ def queue_counts(local_numbers: list[str]) -> dict[str, int]:
         elif status in {"FAILED", "ESCALATED"}:
             counts["attention"] += 1
     return counts
+
+
+def sources_for(text: str) -> list[dict[str, str]]:
+    """The sources an agent cited as [id] in ``text``, with titles, for the console."""
+    from app.database.models import MemoryItem
+    from app.grounding.knowledge import cited_ids, get_chunks
+
+    ids = cited_ids(text)
+    chunks = get_chunks([i for i in ids if "#" in i])
+    memory_ids = [int(i.split(":", 1)[1]) for i in ids if i.startswith("memory:")]
+    memories = {}
+    if memory_ids:
+        with get_db() as db:
+            memories = {m.id: m for m in db.query(MemoryItem).filter(MemoryItem.id.in_(memory_ids)).all()}
+    out = []
+    for cid in ids:
+        if cid in chunks:
+            out.append({"id": cid, "title": chunks[cid].title, "text": chunks[cid].content})
+        elif cid.startswith("memory:") and int(cid.split(":", 1)[1]) in memories:
+            mem = memories[int(cid.split(":", 1)[1])]
+            out.append({"id": cid, "title": f"{mem.kind.title()} memory", "text": mem.content})
+        else:
+            out.append({"id": cid, "title": "Unknown source", "text": "This id is not in the knowledge base."})
+    return out

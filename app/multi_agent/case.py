@@ -20,6 +20,7 @@ class Proposal:
     arguments: dict[str, Any]
     rationale: str
     version: int = 1
+    citations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +61,41 @@ class RescueCase:
     def current_proposal(self) -> Proposal | None:
         return self.proposals[-1] if self.proposals else None
 
+    def planning_facts(self) -> dict[str, Any]:
+        """A trimmed case file for the Planner and Critic, to fit free-tier token limits."""
+        k = self.knowledge or {}
+
+        def short(items, n):
+            return [{"id": i["id"], "title": i.get("title", ""), "text": i.get("text", "")[:n]} for i in items]
+
+        logistics = dict(self.logistics or {})
+        logistics["candidate_slots"] = [
+            {key: s.get(key) for key in ("date", "time_block", "start_time", "end_time", "courier_name",
+                                          "matches_preference", "score")}
+            for s in (logistics.get("candidate_slots") or [])[:6]
+        ]
+        context = {key: v for key, v in (self.context or {}).items() if key != "profile"}
+        return {
+            "incident": {"order_id": self.order_id, "order_number": self.order_number,
+                         "customer_name": self.customer_name, "description": self.description[:300]},
+            "triage": self.triage,
+            "customer_context": context,
+            "logistics": logistics,
+            "knowledge": {
+                "sources": short(k.get("sources", []), 260),
+                "customer_memory": short(k.get("customer_memory", []), 160),
+                "similar_cases": short(k.get("similar_cases", []), 200),
+            },
+            "previous_proposals": [
+                {"version": p.version, "tool_name": p.tool_name, "arguments": p.arguments,
+                 "rationale": p.rationale[:300]}
+                for p in self.proposals
+            ],
+            "critic_reviews": [
+                {"version": r.version, "approved": r.approved, "reason": r.reason} for r in self.reviews
+            ],
+        }
+
     def facts(self) -> dict[str, Any]:
         """The case as plain data, for agent prompts."""
         return {
@@ -77,7 +113,8 @@ class RescueCase:
             "logistics": self.logistics,
             "knowledge": self.knowledge,
             "previous_proposals": [
-                {"version": p.version, "tool_name": p.tool_name, "arguments": p.arguments, "rationale": p.rationale}
+                {"version": p.version, "tool_name": p.tool_name, "arguments": p.arguments,
+                 "rationale": p.rationale, "citations": p.citations}
                 for p in self.proposals
             ],
             "critic_reviews": [

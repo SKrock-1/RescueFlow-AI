@@ -27,6 +27,7 @@ Follow this multi-step loop:
    - Call `get_order` to inspect the order, priority, and delivery status.
    - Call `get_customer_profile` to inspect customer address, preferences, VIP status, and persistent operational memory.
    - Call `get_delivery_history` to check prior failed attempts and reasons.
+   - Call `search_policies` for the operating procedure that applies, and cite its id in square brackets (e.g. [reattempt-policy#attempt-limit]) in your final explanation.
 2. EVALUATE:
    - Call `get_courier_availability` and/or `find_available_delivery_slots` to see available capacity.
    - Match candidate recovery options against customer preferences, VIP tier, and policy rules.

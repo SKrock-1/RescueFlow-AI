@@ -17,7 +17,7 @@ def _utcnow() -> datetime:
 
 from sqlalchemy import (
     Column, Integer, String, Text, Float, Date, Time, DateTime,
-    ForeignKey, Enum as SAEnum,
+    ForeignKey, Boolean, Enum as SAEnum,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -194,3 +194,40 @@ class ProcessedEvent(Base):
     event_id: str = Column(String(200), unique=True, nullable=False)
     kind: str = Column(String(40), nullable=False)
     received_at: datetime = Column(DateTime, default=_utcnow)
+
+
+class KnowledgeChunk(Base):
+    """One section of the knowledge corpus (knowledge/*.md), with its embedding."""
+    __tablename__ = "knowledge_chunks"
+
+    chunk_id: str = Column(String(160), primary_key=True)   # e.g. "reattempt-policy#attempt-limit"
+    source: str = Column(String(120), nullable=False)       # file name without extension
+    title: str = Column(String(200), nullable=False)
+    content: str = Column(Text, nullable=False)
+    embedding: str = Column(Text, nullable=False)           # JSON list of floats
+    content_hash: str = Column(String(64), nullable=False)
+    updated_at: datetime = Column(DateTime, default=_utcnow)
+
+
+class MemoryItem(Base):
+    """Long-term memory: customer facts (semantic) and past rescues (episodic).
+
+    A fact with a ``key`` (for example ``preferred_window``) has at most one
+    active version per customer; a newer value supersedes the old one, which
+    stays for audit with ``active = False``.
+    """
+    __tablename__ = "memory_items"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id: int | None = Column(Integer, ForeignKey("customers.id"), nullable=True)
+    kind: str = Column(String(20), nullable=False)           # semantic | episodic
+    key: str | None = Column(String(60), nullable=True)
+    content: str = Column(Text, nullable=False)
+    importance: float = Column(Float, nullable=False, default=0.5)
+    source: str = Column(String(60), nullable=False, default="agent")   # agent | shopify | legacy:<id>
+    source_incident_id: int | None = Column(Integer, nullable=True)
+    active: bool = Column(Boolean, nullable=False, default=True)
+    superseded_by_id: int | None = Column(Integer, nullable=True)
+    embedding: str = Column(Text, nullable=False)
+    created_at: datetime = Column(DateTime, default=_utcnow)
+    updated_at: datetime = Column(DateTime, default=_utcnow)
