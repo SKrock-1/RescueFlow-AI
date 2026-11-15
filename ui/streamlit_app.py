@@ -36,6 +36,7 @@ from app.services.rescue_view import (
     message_preview,
     proposal_checks,
     shopify_preview,
+    sources_for,
     state_label,
 )
 
@@ -593,6 +594,14 @@ with tab_orders:
                             st.markdown(f"**Proposed change:** {describe_proposal(tool, args)}")
                             if proposal["rationale"]:
                                 st.caption(f"Agent's reasoning: {proposal['rationale']}")
+                            cited = sources_for(proposal["rationale"])
+                            if cited:
+                                st.markdown("**Sources the plan relies on**")
+                                for src in cited:
+                                    with st.expander(f"{src['id']} · {src['title']}"):
+                                        st.write(src["text"])
+                            else:
+                                st.warning("The plan cites no policy or memory source.")
 
                             st.markdown("**Policy checks**")
                             for c in checks:

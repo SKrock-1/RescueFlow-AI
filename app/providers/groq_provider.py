@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from typing import Any
 
 from app.config import get_settings
@@ -16,6 +18,21 @@ from app.errors import ProviderError
 from app.providers.base import LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)
+
+
+MAX_SHORT_WAIT_SECONDS = 6.0
+_RETRY_AFTER = re.compile(r"try again in ([0-9.]+)\s*(ms|s)", re.I)
+
+
+def retry_after_seconds(message: str) -> float | None:
+    """Seconds Groq asks us to wait on a 429, or None when it does not say."""
+    if "429" not in message and "rate limit" not in message.lower():
+        return None
+    match = _RETRY_AFTER.search(message)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value / 1000 if match.group(2).lower() == "ms" else value
 
 
 class GroqProvider(LLMProvider):
@@ -39,6 +56,18 @@ class GroqProvider(LLMProvider):
         except ImportError:
             self._client = None
             logger.warning("groq library not installed. Install with `pip install groq`.")
+
+    def _create_with_short_wait(self, call_kwargs: dict[str, Any]):
+        """Retry once when Groq says a per-minute limit frees up within a few seconds."""
+        try:
+            return self._client.chat.completions.create(**call_kwargs)
+        except Exception as exc:
+            wait = retry_after_seconds(str(exc))
+            if wait is None or wait > MAX_SHORT_WAIT_SECONDS:
+                raise
+            logger.info("Groq per-minute limit reached; waiting %.1fs and retrying once.", wait)
+            time.sleep(wait + 0.25)
+            return self._client.chat.completions.create(**call_kwargs)
 
     def generate(
         self,
@@ -64,7 +93,7 @@ class GroqProvider(LLMProvider):
             call_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")
 
         try:
-            response = self._client.chat.completions.create(**call_kwargs)
+            response = self._create_with_short_wait(call_kwargs)
         except Exception as exc:
             exc_str = str(exc)
             # Automatic fallback if primary model hits Groq rate limit (429 / TPD limit)

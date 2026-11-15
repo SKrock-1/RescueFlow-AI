@@ -16,6 +16,7 @@ from app.tools.delivery_tools import (
     update_delivery_status,
 )
 from app.tools.incident_tools import escalate_incident
+from app.tools.knowledge_tools import search_policies
 
 __all__ = [
     "registry",
@@ -29,4 +30,5 @@ __all__ = [
     "reassign_courier",
     "update_delivery_status",
     "escalate_incident",
+    "search_policies",
 ]
