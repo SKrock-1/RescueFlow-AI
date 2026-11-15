@@ -3,11 +3,16 @@ RescueFlow AI — Resilient Fallback LLM Provider.
 
 Executes sequential failover across providers (e.g., Primary ➔ Secondary ➔ Heuristic Mock).
 Guarantees business continuity when encountering 429 rate limits, model deprecations, or outages.
+
+A provider that fails is put on a short cool-down, so the next call (for
+example the next agent in a multi-agent run) goes straight to a working
+provider instead of waiting for the same timeout again.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from app.errors import ProviderError
@@ -15,14 +20,27 @@ from app.providers.base import LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_COOLDOWN_SECONDS = 120.0
+
 
 class FallbackProvider(LLMProvider):
     """Sequentially attempts candidate LLM providers until one succeeds."""
 
-    def __init__(self, providers: list[LLMProvider]) -> None:
+    def __init__(
+        self,
+        providers: list[LLMProvider],
+        cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
         self.providers = [p for p in providers if p is not None]
         if not self.providers:
             raise ProviderError("fallback", "No active providers supplied to FallbackProvider.")
+        self.cooldown_seconds = cooldown_seconds
+        self._clock = clock
+        self._cooling_until: dict[int, float] = {}
+
+    def _is_cooling(self, index: int) -> bool:
+        return self._cooling_until.get(index, 0.0) > self._clock()
 
     def generate(
         self,
@@ -31,15 +49,23 @@ class FallbackProvider(LLMProvider):
         **kwargs: Any,
     ) -> LLMResponse:
         errors: list[str] = []
-        for provider in self.providers:
+        ready = [i for i in range(len(self.providers)) if not self._is_cooling(i)]
+        # If every provider is cooling down, try them all rather than fail without trying.
+        order = ready or list(range(len(self.providers)))
+        for index in order:
+            provider = self.providers[index]
             prov_ident = getattr(provider, "model", type(provider).__name__)
             try:
-                return provider.generate(messages=messages, tools=tools, **kwargs)
+                response = provider.generate(messages=messages, tools=tools, **kwargs)
+                self._cooling_until.pop(index, None)
+                return response
             except Exception as exc:
+                self._cooling_until[index] = self._clock() + self.cooldown_seconds
                 logger.warning(
-                    "Provider '%s' failed with error: %s. Attempting next provider in fallback chain...",
+                    "Provider '%s' failed (%s); skipping it for %.0fs and trying the next provider.",
                     prov_ident,
                     exc,
+                    self.cooldown_seconds,
                 )
                 errors.append(f"[{prov_ident}]: {exc}")
 
@@ -47,4 +73,3 @@ class FallbackProvider(LLMProvider):
             "fallback",
             f"All providers in fallback chain failed: {' | '.join(errors)}",
         )
-

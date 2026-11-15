@@ -67,6 +67,15 @@ VALID_TRANSITIONS: dict[AgentStatus, set[AgentStatus]] = {
 }
 
 
+# States a run may end in. AWAITING_APPROVAL pauses the run for a person.
+FINISH_STATES = {
+    AgentStatus.AWAITING_APPROVAL,
+    AgentStatus.RESOLVED,
+    AgentStatus.ESCALATED,
+    AgentStatus.FAILED,
+}
+
+
 class AgentState(BaseModel):
     """The central state of the RescueFlow resolution agent."""
     incident_id: int
@@ -94,6 +103,22 @@ class AgentState(BaseModel):
         if new_status not in allowed:
             raise ValueError(
                 f"Illegal state transition from {self.status.value} to {new_status.value}."
+            )
+        self.status = new_status
+
+    def finish(self, new_status: AgentStatus) -> None:
+        """End the run in a terminal state (or paused for approval), with validation.
+
+        Any in-progress state may finish; a run that already finished, or is
+        paused for approval, cannot be finished again with a different outcome.
+        """
+        if new_status not in FINISH_STATES:
+            raise ValueError(f"{new_status.value} is not a finishing state.")
+        if new_status == self.status:
+            return
+        if self.is_finished() or self.status == AgentStatus.AWAITING_APPROVAL:
+            raise ValueError(
+                f"Run already ended as {self.status.value}; cannot change it to {new_status.value}."
             )
         self.status = new_status
 

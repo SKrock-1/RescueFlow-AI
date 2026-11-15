@@ -184,3 +184,13 @@ class AgentRun(Base):
     timestamp: datetime = Column(DateTime, default=_utcnow)
 
     incident = relationship("Incident", back_populates="agent_runs")
+
+
+class ProcessedEvent(Base):
+    """Webhook event IDs already handled, so carrier retries do not start duplicate rescues."""
+    __tablename__ = "processed_events"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    event_id: str = Column(String(200), unique=True, nullable=False)
+    kind: str = Column(String(40), nullable=False)
+    received_at: datetime = Column(DateTime, default=_utcnow)

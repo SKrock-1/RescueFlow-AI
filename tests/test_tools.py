@@ -104,7 +104,7 @@ def test_reassign_courier_success():
     result = reassign_courier(order_id=3, courier_id=1)
     assert result["success"] is True
     assert result["new_courier_id"] == 1
-    assert result["status"] == "REASSIGNED"
+    assert result["action"] == "REASSIGNED"
 
 
 def test_reassign_courier_inactive():

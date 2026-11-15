@@ -31,7 +31,11 @@ class GroqProvider(LLMProvider):
 
         try:
             from groq import Groq
-            self._client = Groq(api_key=self.api_key) if self.api_key else None
+            self._client = (
+                Groq(api_key=self.api_key, timeout=settings.llm_timeout_seconds, max_retries=0)
+                if self.api_key
+                else None
+            )
         except ImportError:
             self._client = None
             logger.warning("groq library not installed. Install with `pip install groq`.")

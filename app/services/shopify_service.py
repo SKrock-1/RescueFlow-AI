@@ -139,7 +139,9 @@ class ShopifyService:
 
         existing_tags = current["order"].get("tags", "")
         tags_set = set(t.strip() for t in existing_tags.split(",") if t.strip())
+        # Tags carry RescueFlow state, so older state and action tags are replaced, not stacked.
         tags_set -= set(RESCUEFLOW_STATE_TAGS)
+        tags_set = {t for t in tags_set if not t.startswith("rf-")}
         tags_set.add(state_tag)
         tags_set.add(f"rf-{action.lower()}")
         if extra_tags:
@@ -313,14 +315,26 @@ class ShopifyService:
             "full_address": full_address or "Online Order Address, Bengaluru, KA",
         }
 
-    def sync_shopify_order_to_db(self, shopify_order_data: dict[str, Any]) -> int:
+    def sync_shopify_order_to_db(
+        self,
+        shopify_order_data: dict[str, Any],
+        failure_reason: str | None = None,
+        new_failure: bool = False,
+        context_note: str | None = None,
+    ) -> tuple[int, int]:
         """
-        Import or update a Shopify order into the local RescueFlow SQLite database
-        so the agent can investigate and rescue it with all available tools.
-        Returns the local (order_id, incident_id).
+        Import or update a Shopify order into the local database so the agent
+        can investigate it, and return the local (order_id, incident_id).
+
+        - ``new_failure=True`` records one more failed delivery attempt (a
+          carrier NDR). Opening the console or planning again does not.
+        - ``context_note`` (e.g. a customer's reply) is added to a newly
+          created incident so the agent reads it.
+        - An OPEN incident is reused; otherwise a new OPEN incident is created.
         """
         from app.database.engine import get_db
-        from app.database.models import Customer, Order, Delivery, DeliveryAttempt, Courier, Incident, AgentMemory
+        from app.database.models import Customer, Order, Delivery, Courier, Incident, AgentMemory
+        from app.domain.lifecycle import IncidentStatus, fail_stale_runs, record_failed_attempt
         from datetime import date as d_cls, time as t_cls, timedelta
 
         order_raw = shopify_order_data.get("order", shopify_order_data)
@@ -427,46 +441,55 @@ class ShopifyService:
                 order.priority = profile_intel["priority"]
                 db.flush()
 
-            # 4. Find or create delivery
+            # 4. Find or create delivery; every failure goes through the attempt counter
+            reason = (failure_reason or "customer_unavailable").strip()
             delivery = db.query(Delivery).filter(Delivery.order_id == order.id).first()
+            attempt_note = f"Linked to live Shopify Order {order_name} (ID: {shopify_id})"
             if not delivery:
                 delivery = Delivery(
                     order_id=order.id,
                     courier_id=courier_id,
-                    status="FAILED",
+                    status="SCHEDULED",
                     scheduled_date=d_cls.today(),
                     scheduled_start=t_cls(10, 0),
                     scheduled_end=t_cls(13, 0),
-                    attempt_count=1,
+                    attempt_count=0,
                     current_location="Delivery Hub #4, Outer Ring Road",
                 )
                 db.add(delivery)
                 db.flush()
+                record_failed_attempt(db, delivery, order, reason, "Customer Address", attempt_note)
+            elif new_failure:
+                record_failed_attempt(db, delivery, order, reason, "Customer Address", attempt_note)
+            db.flush()
 
-            # 5. Create failed attempt if none
-            attempt = db.query(DeliveryAttempt).filter(DeliveryAttempt.delivery_id == delivery.id).first()
-            if not attempt:
-                attempt = DeliveryAttempt(
-                    delivery_id=delivery.id,
-                    attempt_number=1,
-                    reason="customer_unavailable",
-                    location="Customer Address",
-                    notes=f"Linked to live Shopify Order {order_name} (ID: {shopify_id})",
-                )
-                db.add(attempt)
+            # 5. Release runs that crashed mid-way so the order is not stuck
+            fail_stale_runs(db, order.id)
 
-            # 6. Create Incident for the agent to resolve
-            incident = db.query(Incident).filter(Incident.order_id == order.id, Incident.status == "OPEN").first()
+            # 6. Reuse the OPEN incident, or open a new one
+            incident = (
+                db.query(Incident)
+                .filter(Incident.order_id == order.id, Incident.status == IncidentStatus.OPEN.value)
+                .order_by(Incident.id.desc())
+                .first()
+            )
             if not incident:
+                description = (
+                    f"Delivery attempt {delivery.attempt_count} failed for live Shopify Order {order_name}: {reason}."
+                )
+                if context_note:
+                    description += f" {context_note}"
                 incident = Incident(
                     order_id=order.id,
                     incident_type="DELIVERY_FAILED",
                     severity="high",
-                    description=f"Delivery attempt failed for live Shopify Order {order_name}: Customer unreachable at address.",
-                    status="OPEN",
+                    description=description,
+                    status=IncidentStatus.OPEN.value,
                 )
                 db.add(incident)
                 db.flush()
+            elif context_note and context_note not in (incident.description or ""):
+                incident.description = f"{incident.description} {context_note}".strip()
 
             db.commit()
             return order.id, incident.id

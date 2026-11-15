@@ -23,7 +23,9 @@ from app.services.shopify_service import OUTCOME_STATE_TAGS
 STATE_META: dict[str | None, tuple[str, str]] = {
     None: ("Not planned", "orange"),
     "OPEN": ("Not planned", "orange"),
+    "RUNNING": ("Agent working", "blue"),
     "AWAITING_APPROVAL": ("Awaiting approval", "blue"),
+    "EXECUTING": ("Applying approved change", "blue"),
     "RESOLVED": ("Rescued, verified", "green"),
     "ESCALATED": ("Escalated to ops", "gray"),
     "FAILED": ("Failed", "red"),

@@ -13,8 +13,9 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from app.agent.agent import AgentRunner
-from app.database.engine import get_db
-from app.database.models import Incident, Order
+from app.agent.engines import create_runner
+from app.database.engine import get_db, init_db
+from app.database.models import Incident, Order, ProcessedEvent
 from app.providers.factory import create_provider
 from app.services.shopify_service import get_shopify_service
 
@@ -25,6 +26,7 @@ app = FastAPI(
     description="Sub-second autonomous event-driven delivery exception resolution API.",
     version="1.1.0",
 )
+init_db()
 
 
 class DeliveryFailedWebhook(BaseModel):
@@ -33,15 +35,22 @@ class DeliveryFailedWebhook(BaseModel):
     order_name: str | None = Field(default=None, description="Order label (e.g., #1007)")
     failure_reason: str = Field(default="Customer unreachable", description="Failure reason")
     carrier: str | None = Field(default="Shiprocket", description="Carrier name")
+    event_id: str | None = Field(default=None, description="Carrier event ID; repeated IDs are ignored")
 
 
 class CustomerReplyWebhook(BaseModel):
     order_number: str = Field(description="Order number (e.g. #1007 or SHP-1007)")
     customer_phone: str = Field(description="Customer phone number")
     message: str = Field(description="Inbound customer message text")
+    event_id: str | None = Field(default=None, description="Message ID; repeated IDs are ignored")
 
 
-def _run_autonomous_rescue(order_id_or_name: str | int, reason: str) -> None:
+def _run_autonomous_rescue(
+    order_id_or_name: str | int,
+    reason: str,
+    new_failure: bool = False,
+    customer_message: str | None = None,
+) -> None:
     """Background worker executing the full Plan-Act-Observe loop."""
     logger.info("Executing background rescue for order: %s (Reason: %s)", order_id_or_name, reason)
     try:
@@ -63,11 +72,19 @@ def _run_autonomous_rescue(order_id_or_name: str | int, reason: str) -> None:
         else:
             order_data = shopify_order["order"]
 
-        # Sync to DB and get incident ID
-        _, inc_id = shopify_svc.sync_shopify_order_to_db(order_data)
+        # Sync to DB: an NDR counts a failed attempt; a reply is passed to the agent.
+        note = f'Customer replied: "{customer_message}"' if customer_message else None
+        local_order_id, inc_id = shopify_svc.sync_shopify_order_to_db(
+            order_data,
+            failure_reason=None if customer_message else reason,
+            new_failure=new_failure,
+            context_note=note,
+        )
+        # A newer event replaces any plan still waiting for approval on this order.
+        AgentRunner.supersede_open_incidents(local_order_id, keep_incident_id=inc_id)
 
         # Run with resilient fallback provider
-        runner = AgentRunner(provider=create_provider("auto"), max_steps=8)
+        runner = create_runner(provider=create_provider("auto"), max_steps=8)
         result = runner.resolve_incident(inc_id)
 
         # 2-way sync resolution back to Shopify
@@ -81,6 +98,21 @@ def _run_autonomous_rescue(order_id_or_name: str | int, reason: str) -> None:
         logger.info("Autonomous rescue for order %s finished with status %s.", ord_num, result.status)
     except Exception as exc:
         logger.exception("Error in background rescue task: %s", exc)
+
+
+def _first_time(event_id: str | None, kind: str) -> bool:
+    """Record a webhook event ID; False if it was seen before (carriers retry)."""
+    if not event_id:
+        return True
+    from sqlalchemy.exc import IntegrityError
+
+    try:
+        with get_db() as db:
+            db.add(ProcessedEvent(event_id=f"{kind}:{event_id}", kind=kind))
+            db.flush()
+        return True
+    except IntegrityError:
+        return False
 
 
 @app.get("/")
@@ -108,10 +140,17 @@ def handle_delivery_failed(
     or Shopify order fulfillment updates.
     """
     target_ident = payload.order_name or payload.order_id
+    if not _first_time(payload.event_id, "delivery_failed"):
+        return {
+            "status": "duplicate",
+            "message": f"Event {payload.event_id} was already received; no new rescue scheduled.",
+            "event": payload.event,
+        }
     background_tasks.add_task(
         _run_autonomous_rescue,
         order_id_or_name=target_ident,
         reason=payload.failure_reason,
+        new_failure=True,
     )
     return {
         "status": "accepted",
@@ -129,10 +168,16 @@ def handle_customer_reply(
     """
     Ingest interactive WhatsApp / SMS replies from customers.
     """
+    if not _first_time(payload.event_id, "customer_reply"):
+        return {
+            "status": "duplicate",
+            "message": f"Message {payload.event_id} was already received; nothing scheduled.",
+        }
     background_tasks.add_task(
         _run_autonomous_rescue,
         order_id_or_name=payload.order_number,
-        reason=f"Customer WhatsApp Reply: {payload.message}",
+        reason="customer_reply",
+        customer_message=payload.message,
     )
     return {
         "status": "accepted",
