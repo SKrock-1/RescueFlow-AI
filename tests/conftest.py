@@ -5,6 +5,12 @@ RescueFlow AI — Test Fixtures and Setup.
 from __future__ import annotations
 
 import os
+
+# Tests drop and re-seed the database before every test, so they must never
+# touch the database the console and webhook server use. This has to be set
+# before any app module creates the engine.
+os.environ["DATABASE_URL"] = "sqlite:///test_rescueflow.db"
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -15,9 +21,13 @@ from app.database.seed import seed_all
 from app.providers.base import LLMProvider, LLMResponse
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(autouse=True)
 def setup_test_db():
-    """Ensure database is initialized and seeded before running tests."""
+    """Re-seed before every test.
+
+    Incidents follow a strict lifecycle (a finished incident cannot run
+    again), so each test needs its own fresh OPEN incidents.
+    """
     seed_all()
     yield
 

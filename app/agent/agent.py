@@ -39,6 +39,12 @@ from app.agent.memory import (
     summarize_relevant_memory,
 )
 from app.agent.trace import AgentTrace
+from app.domain.lifecycle import (
+    IncidentStatus,
+    IllegalTransition,
+    claim_incident,
+    move_incident,
+)
 from app.agent.observer import AgentObserver
 from app.providers.base import LLMProvider, LLMResponse
 from app.providers.factory import create_provider
@@ -50,7 +56,7 @@ from app.schemas.models import AgentResult, CandidateAction, ActionType
 logger = logging.getLogger(__name__)
 
 # Incident states in which a fresh plan may replace an older, unapproved one.
-SUPERSEDABLE_STATES = {"OPEN", "AWAITING_APPROVAL"}
+SUPERSEDABLE_STATES = {IncidentStatus.OPEN.value, IncidentStatus.AWAITING_APPROVAL.value}
 
 
 def describe_provider_error(exc: Exception | str) -> str:
@@ -195,9 +201,10 @@ class AgentRunner:
 
             if tool_name == "update_delivery_status":
                 want_status = str(arguments.get("status", "")).upper().strip()
-                if order and order.status == want_status:
-                    return True, f"Order status is now {want_status}."
-                return False, "The stored order status does not match the requested status."
+                current = deliv.status if deliv else (order.status if order else None)
+                if current == want_status:
+                    return True, f"Delivery status is now {want_status}."
+                return False, "The stored delivery status does not match the requested status."
 
             if tool_name == "escalate_incident":
                 if order and order.status == "ESCALATED":
@@ -244,7 +251,7 @@ class AgentRunner:
             for inc in rows:
                 if keep_incident_id is not None and inc.id == keep_incident_id:
                     continue
-                inc.status = "SUPERSEDED"
+                move_incident(inc, IncidentStatus.SUPERSEDED)
                 count += 1
         return count
 
@@ -262,7 +269,8 @@ class AgentRunner:
                 .order_by(AgentRun.step_number.desc())
                 .first()
             )
-            inc.status = "REJECTED"
+            if not claim_incident(db, incident_id, IncidentStatus.AWAITING_APPROVAL, IncidentStatus.REJECTED):
+                raise ValueError(f"Incident {incident_id} is no longer awaiting approval.")
             inc.agent_decision = reason
 
         trace = AgentTrace(incident_id=incident_id)
@@ -286,6 +294,11 @@ class AgentRunner:
         proposal = self.get_pending_proposal(incident_id)
         if not proposal:
             raise ValueError(f"Incident {incident_id} has no proposal awaiting approval.")
+
+        # Claim the approval so a double click or a second tab cannot run it twice.
+        with get_db() as db:
+            if not claim_incident(db, incident_id, IncidentStatus.AWAITING_APPROVAL, IncidentStatus.EXECUTING):
+                raise ValueError(f"Incident {incident_id} is no longer awaiting approval.")
 
         with get_db() as db:
             inc = db.query(Incident).filter(Incident.id == incident_id).first()
@@ -360,10 +373,8 @@ class AgentRunner:
         with get_db() as db:
             inc = db.query(Incident).filter(Incident.id == incident_id).first()
             if inc:
-                inc.status = status.value
+                move_incident(inc, IncidentStatus(status.value))
                 inc.agent_decision = decision
-                if status in {AgentStatus.RESOLVED, AgentStatus.ESCALATED}:
-                    inc.resolved_at = datetime.now(timezone.utc)
 
         memory_updates, notifications = self._finalize(
             status=status, action_name_taken=action_taken, customer_id=customer_id,
@@ -400,6 +411,12 @@ class AgentRunner:
             incident = db.query(Incident).filter(Incident.id == incident_id).first()
             if not incident:
                 raise ValueError(f"Incident {incident_id} not found in database.")
+            if not claim_incident(db, incident_id, IncidentStatus.OPEN, IncidentStatus.RUNNING):
+                db.refresh(incident)
+                raise IllegalTransition(
+                    f"Incident {incident_id} is {incident.status}; only OPEN incidents can be run. "
+                    f"Create a new incident to try again."
+                )
 
             order = db.query(Order).filter(Order.id == incident.order_id).first()
             if not order:
@@ -529,9 +546,7 @@ class AgentRunner:
                     tool_call_id = tc["id"]
 
                     # Transition state machine appropriately
-                    if tool_name == "escalate_incident" and not plan_only:
-                        state.transition_to(AgentStatus.ESCALATED)
-                    elif registry.is_mutation(tool_name):
+                    if registry.is_mutation(tool_name):
                         if state.status in {AgentStatus.INVESTIGATING, AgentStatus.EVALUATING}:
                             state.transition_to(AgentStatus.ACTING)
                     elif state.status == AgentStatus.INVESTIGATING:
@@ -640,6 +655,15 @@ class AgentRunner:
                         "content": json.dumps(tool_output),
                     })
 
+                    # Escalation hands the order to a person: no further agent actions.
+                    if tool_name == "escalate_incident" and tool_output.get("success"):
+                        final_decision_text = (llm_response.content or "").strip() or (
+                            f"Escalated to human operations: {arguments.get('reason', '')}".strip()
+                        )
+                        break
+
+                if action_name_taken == "escalate_incident":
+                    break
                 continue
 
             else:
@@ -655,13 +679,13 @@ class AgentRunner:
 
         # 6. Post-loop validation and terminal state assignment
         if proposed_action is not None:
-            state.status = AgentStatus.AWAITING_APPROVAL
+            state.finish(AgentStatus.AWAITING_APPROVAL)
             if not final_decision_text:
                 final_decision_text = f"Proposed {proposed_action['tool_name']}; waiting for operator approval."
         elif provider_failed:
-            state.status = AgentStatus.FAILED
+            state.finish(AgentStatus.FAILED)
         elif step_counter >= self.max_steps and not final_decision_text:
-            state.status = AgentStatus.FAILED
+            state.finish(AgentStatus.FAILED)
             final_decision_text = f"Agent stopped: exceeded maximum iteration limit of {self.max_steps} steps without final resolution."
             self._record_trace_step(
                 trace=trace,
@@ -671,11 +695,11 @@ class AgentRunner:
                 status="error",
             )
         elif action_name_taken == "escalate_incident":
-            state.status = AgentStatus.ESCALATED
+            state.finish(AgentStatus.ESCALATED)
         elif action_executed and mutation_verified:
-            state.status = AgentStatus.RESOLVED
+            state.finish(AgentStatus.RESOLVED)
         elif action_executed:
-            state.status = AgentStatus.FAILED
+            state.finish(AgentStatus.FAILED)
             final_decision_text = (
                 f"The change could not be verified in the database, so this is not marked as resolved. "
                 f"{final_decision_text}"
@@ -687,7 +711,7 @@ class AgentRunner:
                     "tool_name": "escalate_incident",
                     "arguments": {"order_id": order_id, "reason": final_decision_text[:300]},
                 }
-                state.status = AgentStatus.AWAITING_APPROVAL
+                state.finish(AgentStatus.AWAITING_APPROVAL)
                 self._record_trace_step(
                     trace=trace,
                     step_number=step_counter,
@@ -698,9 +722,9 @@ class AgentRunner:
                     status="pending",
                 )
             else:
-                state.status = AgentStatus.ESCALATED
+                state.finish(AgentStatus.ESCALATED)
         else:
-            state.status = AgentStatus.FAILED
+            state.finish(AgentStatus.FAILED)
             final_decision_text = (
                 f"The agent finished without taking a recovery action. {final_decision_text}"
             ).strip()
@@ -709,10 +733,8 @@ class AgentRunner:
         with get_db() as db:
             inc = db.query(Incident).filter(Incident.id == incident_id).first()
             if inc:
-                inc.status = state.status.value
+                move_incident(inc, IncidentStatus(state.status.value))
                 inc.agent_decision = final_decision_text
-                if state.status in {AgentStatus.RESOLVED, AgentStatus.ESCALATED}:
-                    inc.resolved_at = datetime.now(timezone.utc)
                 db.flush()
 
         memory_updates: list[str] = []

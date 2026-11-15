@@ -12,6 +12,14 @@ from typing import Any
 
 from app.database.engine import get_db
 from app.database.models import Incident, Order, Delivery
+from app.domain.lifecycle import (
+    ORDER_STATUS_FOR_DELIVERY,
+    DeliveryStatus,
+    IncidentStatus,
+    delivery_problem,
+    move_delivery,
+    move_incident,
+)
 from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -32,13 +40,27 @@ def escalate_incident(order_id: int, reason: str) -> dict[str, Any]:
                 "reason": f"Order {order_id} does not exist.",
             }
 
-        # Find active incident for this order or create one
+        # Escalate the incident that is being worked on now. A finished or
+        # superseded incident is history and must never be reopened here.
         incident = (
             db.query(Incident)
-            .filter(Incident.order_id == order_id)
+            .filter(
+                Incident.order_id == order_id,
+                Incident.status.in_([IncidentStatus.OPEN.value, IncidentStatus.RUNNING.value,
+                                     IncidentStatus.EXECUTING.value]),
+            )
             .order_by(Incident.id.desc())
             .first()
         )
+
+        delivery = db.query(Delivery).filter(Delivery.order_id == order_id).first()
+        problem = delivery_problem(delivery, DeliveryStatus.ESCALATED)
+        if problem:
+            return {
+                "success": False,
+                "error": "Escalation not allowed",
+                "reason": problem,
+            }
 
         if not incident:
             incident = Incident(
@@ -46,21 +68,19 @@ def escalate_incident(order_id: int, reason: str) -> dict[str, Any]:
                 incident_type="escalation",
                 severity="high",
                 description=f"Auto-created escalation incident: {reason}",
-                status="ESCALATED",
+                status=IncidentStatus.ESCALATED.value,
                 agent_decision=reason,
-                resolved_at=None,
+                resolved_at=datetime.now(timezone.utc),
             )
             db.add(incident)
         else:
-            incident.status = "ESCALATED"
+            move_incident(incident, IncidentStatus.ESCALATED)
             incident.agent_decision = reason
-            incident.resolved_at = datetime.now(timezone.utc)
 
-        # Update order & delivery status
-        order.status = "ESCALATED"
-        delivery = db.query(Delivery).filter(Delivery.order_id == order_id).first()
         if delivery:
-            delivery.status = "ESCALATED"
+            move_delivery(delivery, order, DeliveryStatus.ESCALATED)
+        else:
+            order.status = ORDER_STATUS_FOR_DELIVERY[DeliveryStatus.ESCALATED]
 
         db.flush()
 

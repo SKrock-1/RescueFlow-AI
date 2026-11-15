@@ -616,7 +616,12 @@ with tab_orders:
 
                         if approve:
                             with st.status(f"Running the approved change for {order_num}", expanded=True) as box:
-                                res = AgentRunner(provider=MockProvider()).execute_approved(inc["id"])
+                                try:
+                                    res = AgentRunner(provider=MockProvider()).execute_approved(inc["id"])
+                                except ValueError as claim_err:
+                                    box.update(label=f"{order_num}: not run", state="error")
+                                    st.session_state[f"flash_{oid}"] = ("warning", str(claim_err))
+                                    st.rerun()
                                 outcome_text = state_label(res.status)[0]
                                 box.write(f"Outcome: {outcome_text}. {res.decision_summary}")
                                 ok = res.status in {"RESOLVED", "ESCALATED"}
@@ -642,12 +647,17 @@ with tab_orders:
                             st.rerun()
 
                         if reject:
-                            AgentRunner(provider=MockProvider()).reject_proposal(
-                                inc["id"], "Rejected by operator in the console."
-                            )
-                            st.session_state[f"flash_{oid}"] = ("info", "Plan rejected. Nothing was changed.")
+                            try:
+                                AgentRunner(provider=MockProvider()).reject_proposal(
+                                    inc["id"], "Rejected by operator in the console."
+                                )
+                                st.session_state[f"flash_{oid}"] = ("info", "Plan rejected. Nothing was changed.")
+                            except ValueError as claim_err:
+                                st.session_state[f"flash_{oid}"] = ("warning", str(claim_err))
                             st.rerun()
 
+                elif status in {"RUNNING", "EXECUTING"}:
+                    st.info("Work on this order is in progress. Refresh in a moment to see the result.")
                 elif status == "FAILED":
                     st.error(f"Failed: {inc['decision']}")
                 elif status == "REJECTED":
@@ -678,7 +688,7 @@ with tab_orders:
                 # ── Actions ──
                 b1, b2 = st.columns([3, 2])
                 with b1:
-                    if status != "AWAITING_APPROVAL":
+                    if status not in {"AWAITING_APPROVAL", "RUNNING", "EXECUTING"}:
                         if status in {"FAILED", "REJECTED"}:
                             plan_label = "Plan again"
                         elif status in {"RESOLVED", "ESCALATED"}:
@@ -693,7 +703,12 @@ with tab_orders:
                                 chosen_prov_name = st.session_state.get("chosen_provider", settings.llm_provider)
                                 box.write(f"Investigating with the `{chosen_prov_name}` provider. No changes are made until you approve.")
                                 runner = AgentRunner(provider=create_provider(chosen_prov_name), max_steps=8)
-                                res = runner.resolve_incident(inc_id, plan_only=True)
+                                try:
+                                    res = runner.resolve_incident(inc_id, plan_only=True)
+                                except ValueError as claim_err:
+                                    box.update(label=f"{order_num}: not started", state="error")
+                                    st.session_state[f"flash_{oid}"] = ("warning", str(claim_err))
+                                    st.rerun()
                                 if res.status == "AWAITING_APPROVAL":
                                     box.update(label=f"{order_num}: plan ready for your approval", state="complete")
                                     flash_msg = ("info", "Plan ready. Review the proposed change below, then approve or reject it.")

@@ -23,7 +23,7 @@ class NotificationMessage:
     order_number: str
     message: str
     timestamp: str
-    status: str = "DELIVERED"
+    status: str = "SENT"  # SENT = handed to the (simulated) channel; no delivery receipt exists
 
 
 class NotificationDispatcher:

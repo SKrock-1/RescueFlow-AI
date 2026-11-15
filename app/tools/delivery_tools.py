@@ -19,6 +19,13 @@ from typing import Any
 
 from app.database.engine import get_db
 from app.database.models import Order, Delivery, DeliveryAttempt, Courier, Customer
+from app.domain.lifecycle import (
+    DeliveryStatus,
+    ORDER_STATUS_FOR_DELIVERY,
+    SETTABLE_DELIVERY_STATUSES,
+    delivery_problem,
+    move_delivery,
+)
 from app.tools.registry import registry
 from app.services.scoring import score_option
 
@@ -233,26 +240,29 @@ def reschedule_delivery(order_id: int, date: str, start_time: str, end_time: str
             }
 
         delivery = db.query(Delivery).filter(Delivery.order_id == order_id).first()
+        problem = delivery_problem(delivery, DeliveryStatus.RESCHEDULED)
+        if problem:
+            return {"success": False, "error": "Reschedule not allowed", "reason": problem}
+
         if not delivery:
             # Create delivery if not existing
             delivery = Delivery(
                 order_id=order_id,
-                status="RESCHEDULED",
+                status=DeliveryStatus.RESCHEDULED.value,
                 scheduled_date=new_date,
                 scheduled_start=new_start,
                 scheduled_end=new_end,
                 attempt_count=0,
             )
             db.add(delivery)
+            order.status = ORDER_STATUS_FOR_DELIVERY[DeliveryStatus.RESCHEDULED]
         else:
             delivery.scheduled_date = new_date
             delivery.scheduled_start = new_start
             delivery.scheduled_end = new_end
-            delivery.status = "RESCHEDULED"
+            move_delivery(delivery, order, DeliveryStatus.RESCHEDULED)
 
-        # Update order expected delivery date and status
         order.expected_delivery_date = new_date
-        order.status = "IN_TRANSIT"
 
         db.flush()
 
@@ -294,12 +304,20 @@ def reassign_courier(order_id: int, courier_id: int) -> dict[str, Any]:
             }
 
         delivery = db.query(Delivery).filter(Delivery.order_id == order_id).first()
+        if delivery and delivery.status == DeliveryStatus.DELIVERED.value:
+            return {
+                "success": False,
+                "error": "Reassignment not allowed",
+                "reason": f"Order {order_id} has already been delivered.",
+            }
         if not delivery:
-            delivery = Delivery(order_id=order_id, courier_id=courier_id, status="SCHEDULED")
+            delivery = Delivery(order_id=order_id, courier_id=courier_id, status=DeliveryStatus.SCHEDULED.value)
             db.add(delivery)
+            order.status = ORDER_STATUS_FOR_DELIVERY[DeliveryStatus.SCHEDULED]
         else:
+            # Changing the courier is not a delivery-progress change, so the
+            # status (e.g. RESCHEDULED with its new window) is kept.
             delivery.courier_id = courier_id
-            delivery.status = "REASSIGNED"
 
         db.flush()
 
@@ -310,7 +328,8 @@ def reassign_courier(order_id: int, courier_id: int) -> dict[str, Any]:
             "new_courier_id": courier.id,
             "courier_name": courier.name,
             "vehicle_type": courier.vehicle_type,
-            "status": "REASSIGNED",
+            "action": "REASSIGNED",
+            "status": delivery.status,
             "message": f"Order {order_id} successfully reassigned to courier {courier.name}.",
         }
 
@@ -321,15 +340,15 @@ def update_delivery_status(order_id: int, status: str) -> dict[str, Any]:
     order_id: The numeric ID of the order.
     status: The new status string (e.g. 'IN_TRANSIT', 'SCHEDULED', 'RESCHEDULED', 'ESCALATED', 'FAILED').
     """
-    valid_statuses = {"SCHEDULED", "IN_TRANSIT", "RESCHEDULED", "DELIVERED", "FAILED", "ESCALATED", "ON_HOLD"}
     clean_status = status.upper().strip()
 
-    if clean_status not in valid_statuses:
+    if clean_status not in SETTABLE_DELIVERY_STATUSES:
         return {
             "success": False,
             "error": "Invalid status",
-            "reason": f"Status '{status}' is invalid. Allowed: {sorted(list(valid_statuses))}",
+            "reason": f"Status '{status}' is invalid. Allowed: {sorted(SETTABLE_DELIVERY_STATUSES)}",
         }
+    new_status = DeliveryStatus(clean_status)
 
     with get_db() as db:
         order = db.query(Order).filter(Order.id == order_id).first()
@@ -337,9 +356,13 @@ def update_delivery_status(order_id: int, status: str) -> dict[str, Any]:
             return {"success": False, "error": f"Order {order_id} not found", "reason": "Order does not exist"}
 
         delivery = db.query(Delivery).filter(Delivery.order_id == order_id).first()
+        problem = delivery_problem(delivery, new_status)
+        if problem:
+            return {"success": False, "error": "Status change not allowed", "reason": problem}
         if delivery:
-            delivery.status = clean_status
-        order.status = clean_status
+            move_delivery(delivery, order, new_status)
+        else:
+            order.status = ORDER_STATUS_FOR_DELIVERY[new_status]
 
         db.flush()
 
